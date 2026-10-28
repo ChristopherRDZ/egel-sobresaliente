@@ -10,7 +10,7 @@
   const wrap = (w, h, body, label, maxW) => {
     const id = `fg${++seq}`;
     const defs = `<defs><marker id="${id}a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fah"/></marker></defs>`;
-    return `<figure class="fig"><svg class="fig-svg" viewBox="0 0 ${Math.ceil(w)} ${Math.ceil(h)}" style="max-width:${maxW || Math.ceil(w)}px" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`)}</svg></figure>`;
+    return `<figure class="fig"><svg class="fig-svg" viewBox="0 0 ${Math.ceil(w)} ${Math.ceil(h)}" style="max-width:${maxW || Math.ceil(w)}px;min-width:${Math.round(Math.ceil(w) * 0.62)}px" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`)}</svg></figure>`;
   };
   const unit = (dx, dy) => {
     const L = Math.hypot(dx, dy) || 1;
@@ -43,7 +43,6 @@
 
   // ---------- árbol ----------
   function tree(f) {
-    const DX = 46;
     const DY = 64;
     let slot = 0;
     const all = [];
@@ -70,13 +69,17 @@
       return node;
     }
     walk(f.root, 0);
+    for (const n of all) Object.assign(n, nodeSize(n.v));
+    // la separación entre hojas crece con la etiqueta más ancha para que los nodos no se encimen
+    const half = Math.max(...all.map((n) => n.r || n.w / 2));
+    const DX = Math.max(46, 2 * half + 12);
     const minX = Math.min(...all.map((n) => n.x));
     const maxX = Math.max(...all.map((n) => n.x));
     const maxD = Math.max(...all.map((n) => n.depth));
     const PAD = 30;
+    const MX = Math.max(PAD + 10, half + 8);
     for (const n of all) {
-      Object.assign(n, nodeSize(n.v));
-      n.px = PAD + (n.x - minX) * DX + 10;
+      n.px = MX + (n.x - minX) * DX;
       n.py = PAD + n.depth * DY;
     }
     let body = '';
@@ -89,31 +92,31 @@
       }
     }
     for (const n of all) body += drawNode({ x: n.px, y: n.py, r: n.r, w: n.w, h: n.h }, n.v, { hl: n.hl });
-    const w = PAD * 2 + (maxX - minX) * DX + 20;
+    const w = MX * 2 + (maxX - minX) * DX;
     const h = PAD * 2 + maxD * DY;
     return wrap(Math.max(w, 120), h, body, 'Árbol', Math.max(w, 120) * 1.05);
   }
 
   // ---------- grafo ----------
   function graph(f) {
-    const nodes = f.nodes.map((n) => ({ id: String(n.id), label: n.label != null ? String(n.label) : String(n.id), shape: n.shape || 'circle', tokens: n.tokens, x: n.x, y: n.y, hl: !!n.hl }));
+    const nodes = f.nodes.map((n) => ({ id: String(n.id), label: n.label != null ? String(n.label) : String(n.id), shape: n.shape || 'circle', tokens: n.tokens, ix: n.x, iy: n.y, hl: !!n.hl }));
     const n = nodes.length;
-    const hasXY = nodes.every((p) => typeof p.x === 'number');
+    const hasXY = nodes.every((p) => typeof p.ix === 'number' && typeof p.iy === 'number');
     const W = hasXY ? 560 : n <= 3 ? 360 : n <= 5 ? 440 : 520;
     const H = hasXY ? 340 : n <= 3 ? 260 : n <= 5 ? 330 : 400;
     const PAD = 42;
     nodes.forEach((p, i) => {
       if (hasXY) {
-        p.px = PAD + (p.x / 100) * (W - 2 * PAD);
-        p.py = PAD + (p.y / 100) * (H - 2 * PAD);
+        p.x = PAD + (p.ix / 100) * (W - 2 * PAD);
+        p.y = PAD + (p.iy / 100) * (H - 2 * PAD);
       } else if (n === 1) {
-        p.px = W / 2;
-        p.py = H / 2;
+        p.x = W / 2;
+        p.y = H / 2;
       } else {
         const R = Math.min(W, H) / 2 - PAD;
         const ang = -Math.PI / 2 + (2 * Math.PI * i) / n;
-        p.px = W / 2 + R * Math.cos(ang);
-        p.py = H / 2 + R * Math.sin(ang);
+        p.x = W / 2 + R * Math.cos(ang);
+        p.y = H / 2 + R * Math.sin(ang);
       }
       if (p.shape === 'box') Object.assign(p, { w: Math.max(28, 8.2 * p.label.length + 14), h: 28 });
       else Object.assign(p, nodeSize(p.label));
@@ -131,28 +134,28 @@
       if (a === b) {
         const cx = W / 2;
         const cy = H / 2;
-        const [ox, oy] = unit(a.px - cx || 0.001, a.py - cy || -1);
+        const [ox, oy] = unit(a.x - cx || 0.001, a.y - cy || -1);
         const r = a.r || a.h / 2;
-        const base = [a.px + ox * r, a.py + oy * r];
+        const base = [a.x + ox * r, a.y + oy * r];
         const px = -oy;
         const py = ox;
         const c1 = [base[0] + ox * 46 + px * 22, base[1] + oy * 46 + py * 22];
         const c2 = [base[0] + ox * 46 - px * 22, base[1] + oy * 46 - py * 22];
-        const s = [a.px + (ox + px * 0.5) * r * 0.9, a.py + (oy + py * 0.5) * r * 0.9];
-        const en = [a.px + (ox - px * 0.5) * r * 0.9, a.py + (oy - py * 0.5) * r * 0.9];
+        const s = [a.x + (ox + px * 0.5) * r * 0.9, a.y + (oy + py * 0.5) * r * 0.9];
+        const en = [a.x + (ox - px * 0.5) * r * 0.9, a.y + (oy - py * 0.5) * r * 0.9];
         body += `<path d="M${s[0]},${s[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${en[0]},${en[1]}" class="fe"${directed ? ' marker-end="MARK"' : ''}/>`;
         if (e.label) labels += t(base[0] + ox * 44, base[1] + oy * 44, e.label, 'fel');
         continue;
       }
       const rev = directed && pairs.has(`${e.to}→${e.from}`);
-      const [ux, uy] = unit(b.px - a.px, b.py - a.py);
+      const [ux, uy] = unit(b.x - a.x, b.y - a.y);
       if (rev) {
-        const mx = (a.px + b.px) / 2;
-        const my = (a.py + b.py) / 2;
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
         const off = 26;
         const c = [mx - uy * off, my + ux * off];
-        const [sx, sy] = unit(c[0] - a.px, c[1] - a.py);
-        const [ex, ey] = unit(c[0] - b.px, c[1] - b.py);
+        const [sx, sy] = unit(c[0] - a.x, c[1] - a.y);
+        const [ex, ey] = unit(c[0] - b.x, c[1] - b.y);
         const p1 = border(a, sx, sy);
         const p2 = border(b, ex, ey);
         body += `<path d="M${p1[0]},${p1[1]} Q${c[0]},${c[1]} ${p2[0]},${p2[1]}" class="fe" marker-end="MARK"/>`;
@@ -170,9 +173,9 @@
         const k = p.tokens;
         if (k > 0 && k <= 4) {
           const pos = { 1: [[0, 0]], 2: [[-5, 0], [5, 0]], 3: [[-5, 4], [5, 4], [0, -5]], 4: [[-5, -5], [5, -5], [-5, 5], [5, 5]] }[k];
-          for (const [dx, dy] of pos) body += `<circle cx="${p.px + dx}" cy="${p.py + dy}" r="3.2" class="ftok"/>`;
-        } else if (k > 4) body += t(p.px, p.py, String(k), 'fl');
-        labels += t(p.px, p.py - (p.r || 14) - 11, p.label, 'fel');
+          for (const [dx, dy] of pos) body += `<circle cx="${p.x + dx}" cy="${p.y + dy}" r="3.2" class="ftok"/>`;
+        } else if (k > 4) body += t(p.x, p.y, String(k), 'fl');
+        labels += t(p.x, p.y - (p.r || 14) - 11, p.label, 'fel');
       }
     }
     return wrap(W, H, body + labels, 'Grafo', W);
