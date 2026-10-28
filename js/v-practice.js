@@ -113,17 +113,21 @@
     const fixedFilter = ['wrong', 'due', 'marked'].includes(preset);
     const titles = { smart: 'Práctica inteligente', weak: 'Subáreas difíciles', wrong: 'Mis errores', due: 'Repaso pendiente', marked: 'Guardadas', innov: 'Reactivos de innovación', area: D.area(el.dataset.area) ? D.area(el.dataset.area).name : 'Área', sub: el.dataset.sub ? `${el.dataset.sub} · ${D.sub(el.dataset.sub).short || D.sub(el.dataset.sub).name}` : '' };
     cfg.title = titles[preset] || 'Práctica';
-    const count = () => {
-      const pool = S.pick({ subs: cfg.subs, types: cfg.types, n: 99999, filter: fixedFilter ? cfg.filter : BUILD.filter, diffs: BUILD.diffs, keepCases: false });
-      return pool.length;
-    };
+    // solo filtra (countOnly): sin la selección completa en cada toque
+    const count = () => S.pick({ subs: cfg.subs, types: cfg.types, filter: fixedFilter ? cfg.filter : BUILD.filter, diffs: BUILD.diffs, countOnly: true }).length;
     const render = (panel) => {
       const avail = count();
       U.$('#bldAvail', panel).textContent = `${U.plural(avail, 'pregunta disponible', 'preguntas disponibles')} con estos filtros`;
-      U.$$('[data-bn]', panel).forEach((b) => b.classList.toggle('on', Number(b.dataset.bn) === BUILD.n));
-      U.$$('[data-bf]', panel).forEach((b) => b.classList.toggle('on', b.dataset.bf === BUILD.filter));
-      U.$$('[data-bm]', panel).forEach((b) => b.classList.toggle('on', b.dataset.bm === BUILD.mode));
-      U.$$('[data-bd]', panel).forEach((b) => b.classList.toggle('on', BUILD.diffs.includes(Number(b.dataset.bd))));
+      // estado visible y para lectores de pantalla
+      const mark = (sel, isOn) => U.$$(sel, panel).forEach((b) => {
+        const on = isOn(b);
+        b.classList.toggle('on', on);
+        b.setAttribute('aria-pressed', String(on));
+      });
+      mark('[data-bn]', (b) => Number(b.dataset.bn) === BUILD.n);
+      mark('[data-bf]', (b) => b.dataset.bf === BUILD.filter);
+      mark('[data-bm]', (b) => b.dataset.bm === BUILD.mode);
+      mark('[data-bd]', (b) => BUILD.diffs.includes(Number(b.dataset.bd)));
     };
     const filters = [['smart', 'Inteligente'], ['new', 'Solo nuevas'], ['wrong', 'Falladas'], ['all', 'Al azar']];
     const v = await ui.modal({
@@ -177,7 +181,8 @@
       const hist = sessions.length
         ? `<ol class="hist">${sessions.map(histRow).join('')}</ol><button type="button" class="link" data-act="nav" data-to="history">${ui.icon('list')} Ver todo el historial</button>`
         : `<p class="muted">Aquí verás tus sesiones terminadas para revisar cada respuesta.</p>`;
-      const active = S.sessions().filter((s) => !s.done && s.qs.some((id) => !(s.it[id] && s.it[id][0] != null)));
+      // también las que tienen todo respondido pero falta terminar (calificar)
+      const active = S.sessions().filter((s) => !s.done);
       const pend = active.length ? `<section class="card"><h2 class="card-h">Sesiones sin terminar</h2><ol class="hist">${active.slice(0, 5).map((s) => { const sc = S.sessionScore(s); return `<li><button type="button" class="hist-row" data-act="resume" data-id="${esc(s.id)}"><span class="hist-ic">${ui.icon('play')}</span><span class="hist-b"><b>${esc(s.title)}</b><span class="muted small">${esc(U.fmtDateTime(s.t0))} · ${sc.n}/${sc.total} respondidas</span></span>${ui.icon('right')}</button></li>`; }).join('')}</ol></section>` : '';
       return `<div class="page">
         <header class="page-h"><div><h1>Repaso</h1><p class="muted">Las preguntas que fallas regresan al día siguiente; las que aciertas, cada vez más espaciadas (3, 7, 16 días). Así fijas lo aprendido sin perder tiempo en lo que ya dominas.</p></div></header>
@@ -206,8 +211,17 @@
     html(p) {
       const all = S.sessions().filter((s) => s.done);
       const lim = (p && p.lim) || 60;
-      return `<div class="page"><header class="page-h"><div><h1>Historial</h1><p class="muted">${U.plural(all.length, 'sesión terminada', 'sesiones terminadas')}. Toca una para revisar cada pregunta.</p></div></header><section class="card">${all.length ? `<ol class="hist">${all.slice(0, lim).map(histRow).join('')}</ol>` : '<p class="muted">Todavía no terminas ninguna sesión.</p>'}${all.length > lim ? `<button type="button" class="btn btn-ghost" data-act="nav" data-to="history" data-p='${esc(JSON.stringify({ lim: lim + 60 }))}'>Ver más</button>` : ''}</section></div>`;
+      return `<div class="page"><header class="page-h"><div><h1>Historial</h1><p class="muted">${U.plural(all.length, 'sesión terminada', 'sesiones terminadas')}. Toca una para revisar cada pregunta.</p></div></header><section class="card">${all.length ? `<ol class="hist">${all.slice(0, lim).map(histRow).join('')}</ol>` : '<p class="muted">Todavía no terminas ninguna sesión.</p>'}${all.length > lim ? `<button type="button" class="btn btn-ghost" data-act="history-more">Ver más</button>` : ''}</section></div>`;
     },
+  };
+  // amplía la misma vista sin apilar otra entrada ni volver al principio de la lista; el foco pasa a la primera
+  // fila nueva (el botón se reemplazó con la vista)
+  A['history-more'] = () => {
+    const lim = EG.router.cur.params.lim || 60;
+    EG.router.go('history', { lim: lim + 60 }, { replace: true, keepScroll: true });
+    const li = U.$$('#view .hist li')[lim];
+    const b = li && li.querySelector('button');
+    if (b) b.focus({ preventScroll: true });
   };
 
   // ---------- Simulacros ----------
@@ -275,7 +289,8 @@
       };
       inp.addEventListener('input', U.debounce(run, 180));
       if (inp.value) run();
-      setTimeout(() => inp.focus(), 50);
+      // al volver a una búsqueda no se enfoca el campo: se conserva la posición y no se abre el teclado
+      if (!p || !p.q) setTimeout(() => inp.focus({ preventScroll: true }), 50);
     },
   };
 })();

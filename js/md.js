@@ -88,7 +88,8 @@
     s = escText(s);
     s = s.replace(/&lt;(\/?)(sup|sub)&gt;/g, '<$1$2>').replace(/&lt;br\s*\/?&gt;/g, '<br>');
     s = s.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/(^|[\s(¿¡"'“«—–\-])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?=$|[\s.,;:!?)"'”»—–\-])/g, '$1<em>$2</em>');
+    // la cursiva no abre con puntuación: un * de Kleene ("por *: c*") se queda como asterisco
+    s = s.replace(/(^|[\s(¿¡"'“«—–\-])\*(?=[^\s*.,;:!?)\]}])([^*\n]*?[^\s*])\*(?=$|[\s.,;:!?)"'”»—–\-])/g, '$1<em>$2</em>');
     s = s.replace(/\u0000(\d+)\u0000/g, (m, k) => `<code>${escText(codes[Number(k)])}</code>`);
     return s;
   }
@@ -98,10 +99,27 @@
   const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
   const isUl = (l) => /^\s*[-•] \S/.test(l);
   const isOl = (l) => /^\s*\d+[.)] \S/.test(l);
-  const isBlockStart = (l, next) => /^```/.test(l) || /^#{1,4} /.test(l) || /^>/.test(l) || isUl(l) || isOl(l) || (isTableRow(l) && next != null && isSep(next));
+  // cerca de código: ``` al inicio del renglón o con hasta 3 espacios de sangría
+  const FENCE = /^ {0,3}```/;
+  const isBlockStart = (l, next) => FENCE.test(l) || /^#{1,4} /.test(l) || /^>/.test(l) || isUl(l) || isOl(l) || (isTableRow(l) && next != null && isSep(next));
 
+  // "\|" es una barra literal dentro de la celda (GFM), también dentro de código
   function cells(row) {
-    return row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+    return row.split('\\|').join('\u0001').trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim().split('\u0001').join('|'));
+  }
+
+  // Consume la cerca que empieza en lines[i] quitando a cada renglón la sangría de la cerca; devuelve [html, siguiente i].
+  function fence(lines, i) {
+    const m = /^(\s*)```\s*(.*)$/.exec(lines[i]);
+    const ind = m[1].length;
+    const lang = m[2].trim().toLowerCase();
+    const buf = [];
+    i++;
+    while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+      const l = lines[i++];
+      buf.push(l.slice(Math.min(ind, l.length - l.replace(/^ +/, '').length)));
+    }
+    return [codeBlock(buf.join('\n'), lang), i + 1];
   }
 
   function render(src, opts) {
@@ -111,13 +129,10 @@
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
-      if (/^```/.test(line)) {
-        const lang = line.slice(3).trim().toLowerCase();
-        const buf = [];
-        i++;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) buf.push(lines[i++]);
-        i++;
-        out.push(codeBlock(buf.join('\n'), lang));
+      if (FENCE.test(line)) {
+        const [h, ni] = fence(lines, i);
+        out.push(h);
+        i = ni;
         continue;
       }
       if (/^\s*$/.test(line)) {
@@ -158,14 +173,21 @@
         while (i < lines.length && (ordered ? isOl(lines[i]) : isUl(lines[i]))) {
           const mm = ordered ? /^\s*(\d+)[.)] (.*)$/.exec(lines[i]) : /^\s*[-•] (.*)$/.exec(lines[i]);
           if (ordered && start == null) start = Number(mm[1]);
-          let text = ordered ? mm[2] : mm[1];
+          // renglones de continuación uno por uno; una cerca con sangría es un bloque de código dentro del elemento
+          let html = inline(ordered ? mm[2] : mm[1]);
           i++;
-          while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !isUl(lines[i]) && !isOl(lines[i])) text += '<br>' + lines[i++].trim();
-          items.push(text);
+          while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !isUl(lines[i]) && !isOl(lines[i])) {
+            if (/^\s+```/.test(lines[i])) {
+              const [h, ni] = fence(lines, i);
+              html += h;
+              i = ni;
+            } else html += '<br>' + inline(lines[i++].trim());
+          }
+          items.push(html);
         }
         const tag = ordered ? 'ol' : 'ul';
         const st = ordered && start && start !== 1 ? ` start="${start}"` : '';
-        out.push(`<${tag}${st}>${items.map((t) => `<li>${inline(t).replace(/&lt;br&gt;/g, '<br>')}</li>`).join('')}</${tag}>`);
+        out.push(`<${tag}${st}>${items.map((t) => `<li>${t}</li>`).join('')}</${tag}>`);
         continue;
       }
       const buf = [line];
@@ -187,8 +209,12 @@
   function plain(src) {
     return String(src == null ? '' : src)
       .replace(/```[a-z]*\n?/g, '')
+      // etiquetas antes que los marcadores (si no, se borra el ">" de <sup> y queda "A<sup p</sup")
+      .replace(/<sup>/g, '^')
+      .replace(/<sub>/g, '_')
+      .replace(/<\/(sup|sub)>/g, '')
+      .replace(/<br\s*\/?>/g, ' ')
       .replace(/[*`#>|]/g, ' ')
-      .replace(/<\/?(sup|sub|br)>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
   }

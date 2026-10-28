@@ -7,11 +7,17 @@
 
   const t = (x, y, s, cls, extra) =>
     `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" class="${cls || 'fl'}" text-anchor="middle" dominant-baseline="central"${extra || ''}>${escText(s)}</text>`;
-  const wrap = (w, h, body, label, maxW) => {
+  // label: descripción completa de la figura (role=img oculta sus textos a los lectores de pantalla).
+  // El mínimo de ancho nunca pasa del contenedor: en teléfono ningún nodo queda fuera de la vista y, si la figura
+  // queda muy reducida, «Ampliar figura» (o tocarla) la abre a tamaño natural (fit y zoom, abajo).
+  const wrap = (w, h, body, label, maxW, x0, y0) => {
     const id = `fg${++seq}`;
+    const W = Math.ceil(w);
     const defs = `<defs><marker id="${id}a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fah"/></marker></defs>`;
-    return `<figure class="fig"><svg class="fig-svg" viewBox="0 0 ${Math.ceil(w)} ${Math.ceil(h)}" style="max-width:${maxW || Math.ceil(w)}px;min-width:${Math.round(Math.ceil(w) * 0.62)}px" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`)}</svg></figure>`;
+    const zi = EG.ui && EG.ui.icon ? EG.ui.icon('expand') : '';
+    return `<figure class="fig" data-w="${W}"><svg class="fig-svg" data-act="fig-zoom" viewBox="${x0 || 0} ${y0 || 0} ${W} ${Math.ceil(h)}" style="max-width:${maxW || W}px;min-width:min(100%, ${Math.round(W * 0.62)}px)" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`)}</svg><button type="button" class="btn btn-ghost btn-sm fig-zoom" data-act="fig-zoom" hidden>${zi}<span>Ampliar figura</span></button></figure>`;
   };
+  const list = (xs) => xs.join(', ');
   const unit = (dx, dy) => {
     const L = Math.hypot(dx, dy) || 1;
     return [dx / L, dy / L];
@@ -20,20 +26,28 @@
     const s = String(label);
     return s.length <= 3 ? { r: 17 } : { w: Math.max(34, 8.2 * s.length + 14), h: 30 };
   };
-  // punto en el borde de un nodo (círculo o rectángulo) en dirección (ux, uy)
+  // punto en el borde de un nodo (círculo, rectángulo, óvalo o rombo) en dirección (ux, uy)
   const border = (p, ux, uy) => {
     if (p.r) return [p.x + ux * p.r, p.y + uy * p.r];
     const hw = p.w / 2;
     const hh = p.h / 2;
-    const k = Math.min(Math.abs(ux) > 1e-6 ? hw / Math.abs(ux) : Infinity, Math.abs(uy) > 1e-6 ? hh / Math.abs(uy) : Infinity);
+    let k;
+    if (p.sh === 'oval') k = 1 / Math.hypot(ux / hw, uy / hh);
+    else if (p.sh === 'diamond') k = 1 / (Math.abs(ux) / hw + Math.abs(uy) / hh);
+    else k = Math.min(Math.abs(ux) > 1e-6 ? hw / Math.abs(ux) : Infinity, Math.abs(uy) > 1e-6 ? hh / Math.abs(uy) : Infinity);
     return [p.x + ux * k, p.y + uy * k];
   };
   const drawNode = (p, label, opts) => {
     const o = opts || {};
+    const cls = `fn${o.hl ? ' fn-hl' : ''}`;
     let s = '';
     if (p.r) {
-      s += `<circle cx="${p.x}" cy="${p.y}" r="${p.r}" class="fn${o.hl ? ' fn-hl' : ''}"/>`;
+      s += `<circle cx="${p.x}" cy="${p.y}" r="${p.r}" class="${cls}"/>`;
       if (o.double) s += `<circle cx="${p.x}" cy="${p.y}" r="${p.r - 4}" class="fn fn-in"/>`;
+    } else if (p.sh === 'oval') {
+      s += `<ellipse cx="${p.x}" cy="${p.y}" rx="${p.w / 2}" ry="${p.h / 2}" class="${cls}"/>`;
+    } else if (p.sh === 'diamond') {
+      s += `<polygon points="${p.x},${p.y - p.h / 2} ${p.x + p.w / 2},${p.y} ${p.x},${p.y + p.h / 2} ${p.x - p.w / 2},${p.y}" class="${cls}"/>`;
     } else {
       s += `<rect x="${p.x - p.w / 2}" y="${p.y - p.h / 2}" width="${p.w}" height="${p.h}" rx="${o.box ? 3 : 8}" class="fn${o.hl ? ' fn-hl' : ''}"/>`;
     }
@@ -94,7 +108,17 @@
     for (const n of all) body += drawNode({ x: n.px, y: n.py, r: n.r, w: n.w, h: n.h }, n.v, { hl: n.hl });
     const w = MX * 2 + (maxX - minX) * DX;
     const h = PAD * 2 + maxD * DY;
-    return wrap(Math.max(w, 120), h, body, 'Árbol', Math.max(w, 120) * 1.05);
+    // descripción: hijos de cada nodo (en los binarios, izquierdo y derecho, con "vacío" si falta)
+    const rows = [];
+    (function desc(n) {
+      if (!n) return;
+      const kids = Array.isArray(n.c) ? n.c : [];
+      if (kids.some((k) => k != null)) rows.push(`${n.v}: ${kids.length === 2 ? `izquierdo ${kids[0] ? kids[0].v : 'vacío'}, derecho ${kids[1] ? kids[1].v : 'vacío'}` : list(kids.filter((k) => k != null).map((k) => k.v))}`);
+      kids.forEach(desc);
+    })(f.root);
+    const hl = all.filter((n) => n.hl).map((n) => n.v);
+    const label = `Árbol con raíz ${f.root ? f.root.v : ''}.${rows.length ? ` Hijos: ${rows.join('; ')}.` : ''}${hl.length ? ` Resaltados: ${list(hl)}.` : ''}`;
+    return wrap(Math.max(w, 120), h, body, label, Math.max(w, 120) * 1.05);
   }
 
   // ---------- grafo ----------
@@ -103,7 +127,8 @@
     const n = nodes.length;
     const hasXY = nodes.every((p) => typeof p.ix === 'number' && typeof p.iy === 'number');
     const W = hasXY ? 560 : n <= 3 ? 360 : n <= 5 ? 440 : 520;
-    const H = hasXY ? 340 : n <= 3 ? 260 : n <= 5 ? 330 : 400;
+    // con coordenadas, "h" alarga el lienzo (p. ej., diagramas de flujo de una sola columna)
+    const H = hasXY ? EG.U.clamp(Number(f.h) || 340, 200, 700) : n <= 3 ? 260 : n <= 5 ? 330 : 400;
     const PAD = 42;
     nodes.forEach((p, i) => {
       if (hasXY) {
@@ -119,6 +144,9 @@
         p.y = H / 2 + R * Math.sin(ang);
       }
       if (p.shape === 'box') Object.assign(p, { w: Math.max(28, 8.2 * p.label.length + 14), h: 28 });
+      // óvalo (inicio o fin) y rombo (decisión) de los diagramas de flujo: el texto cabe dentro de la figura
+      else if (p.shape === 'oval') Object.assign(p, { sh: 'oval', w: Math.max(56, 10.3 * p.label.length + 24), h: 32 });
+      else if (p.shape === 'diamond') Object.assign(p, { sh: 'diamond', w: Math.max(60, (2 * 8.2 * p.label.length) / 1.4 + 20), h: 48 });
       else Object.assign(p, nodeSize(p.label));
     });
     const byId = new Map(nodes.map((p) => [p.id, p]));
@@ -127,6 +155,16 @@
     const pairs = new Set(edges.map((e) => `${e.from}→${e.to}`));
     let body = '';
     let labels = '';
+    // caja real de lo dibujado (nodos, bucles y etiquetas): el viewBox no deja márgenes de sobra
+    const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    const ext = (x, y, rx, ry) => {
+      box.x0 = Math.min(box.x0, x - rx);
+      box.x1 = Math.max(box.x1, x + rx);
+      box.y0 = Math.min(box.y0, y - ry);
+      box.y1 = Math.max(box.y1, y + ry);
+    };
+    const extLabel = (x, y, s) => ext(x, y, 4 * String(s).length + 6, 10);
+    for (const p of nodes) ext(p.x, p.y, p.r || p.w / 2, p.r || p.h / 2);
     for (const e of edges) {
       const a = byId.get(e.from);
       const b = byId.get(e.to);
@@ -144,7 +182,12 @@
         const s = [a.x + (ox + px * 0.5) * r * 0.9, a.y + (oy + py * 0.5) * r * 0.9];
         const en = [a.x + (ox - px * 0.5) * r * 0.9, a.y + (oy - py * 0.5) * r * 0.9];
         body += `<path d="M${s[0]},${s[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${en[0]},${en[1]}" class="fe"${directed ? ' marker-end="MARK"' : ''}/>`;
-        if (e.label) labels += t(base[0] + ox * 44, base[1] + oy * 44, e.label, 'fel');
+        ext(c1[0], c1[1], 2, 2);
+        ext(c2[0], c2[1], 2, 2);
+        if (e.label) {
+          labels += t(base[0] + ox * 44, base[1] + oy * 44, e.label, 'fel');
+          extLabel(base[0] + ox * 44, base[1] + oy * 44, e.label);
+        }
         continue;
       }
       const rev = directed && pairs.has(`${e.to}→${e.from}`);
@@ -159,12 +202,20 @@
         const p1 = border(a, sx, sy);
         const p2 = border(b, ex, ey);
         body += `<path d="M${p1[0]},${p1[1]} Q${c[0]},${c[1]} ${p2[0]},${p2[1]}" class="fe" marker-end="MARK"/>`;
-        if (e.label) labels += t(0.25 * p1[0] + 0.5 * c[0] + 0.25 * p2[0], 0.25 * p1[1] + 0.5 * c[1] + 0.25 * p2[1], e.label, 'fel');
+        const mid = [0.25 * p1[0] + 0.5 * c[0] + 0.25 * p2[0], 0.25 * p1[1] + 0.5 * c[1] + 0.25 * p2[1]];
+        ext(mid[0], mid[1], 2, 2);
+        if (e.label) {
+          labels += t(mid[0], mid[1], e.label, 'fel');
+          extLabel(mid[0], mid[1], e.label);
+        }
       } else {
         const p1 = border(a, ux, uy);
         const p2 = border(b, -ux, -uy);
         body += `<line x1="${p1[0]}" y1="${p1[1]}" x2="${p2[0]}" y2="${p2[1]}" class="fe"${directed ? ' marker-end="MARK"' : ''}/>`;
-        if (e.label) labels += t((p1[0] + p2[0]) / 2 - uy * 11, (p1[1] + p2[1]) / 2 + ux * 11, e.label, 'fel');
+        if (e.label) {
+          labels += t((p1[0] + p2[0]) / 2 - uy * 11, (p1[1] + p2[1]) / 2 + ux * 11, e.label, 'fel');
+          extLabel((p1[0] + p2[0]) / 2 - uy * 11, (p1[1] + p2[1]) / 2 + ux * 11, e.label);
+        }
       }
     }
     for (const p of nodes) {
@@ -176,9 +227,21 @@
           for (const [dx, dy] of pos) body += `<circle cx="${p.x + dx}" cy="${p.y + dy}" r="3.2" class="ftok"/>`;
         } else if (k > 4) body += t(p.x, p.y, String(k), 'fl');
         labels += t(p.x, p.y - (p.r || 14) - 11, p.label, 'fel');
+        extLabel(p.x, p.y - (p.r || 14) - 11, p.label);
       }
     }
-    return wrap(W, H, body + labels, 'Grafo', W);
+    if (box.x0 === Infinity) ext(W / 2, H / 2, 20, 20);
+    const M = 6;
+    const x0 = Math.floor(box.x0 - M);
+    const y0 = Math.floor(box.y0 - M);
+    const w = Math.ceil(box.x1 + M) - x0;
+    const h = Math.ceil(box.y1 + M) - y0;
+    // descripción: nodos (con sus marcas) y aristas con su peso o etiqueta
+    const name = (id) => byId.get(id).label;
+    const nodeDesc = nodes.map((p) => p.label + (p.shape === 'oval' ? ' (terminal)' : p.shape === 'diamond' ? ' (decisión)' : '') + (p.tokens != null ? ` (${p.tokens} ${p.tokens === 1 ? 'marca' : 'marcas'})` : '') + (p.hl ? ' (resaltado)' : ''));
+    const edgeDesc = edges.filter((e) => byId.has(e.from) && byId.has(e.to)).map((e) => `${name(e.from)}${directed ? ' → ' : ' – '}${name(e.to)}${e.label ? ` (${e.label})` : ''}`);
+    const label = `${directed ? 'Grafo dirigido' : 'Grafo no dirigido'}. Nodos: ${list(nodeDesc)}.${edgeDesc.length ? ` ${directed ? 'Arcos' : 'Aristas'}: ${list(edgeDesc)}.` : ''}`;
+    return wrap(w, h, body + labels, label, w, x0, y0);
   }
 
   // ---------- autómata ----------
@@ -214,8 +277,9 @@
       H = top + R + maxDown + 34;
       S.forEach((s, i) => pos.push({ x: 90 + i * DX, y: top + 6, r: R }));
     } else {
-      W = 520;
-      H = 420;
+      // con radio 160, el margen deja dentro la flecha y la etiqueta de inicio y los bucles de arriba y abajo
+      W = 560;
+      H = 480;
       S.forEach((s, i) => {
         const ang = -Math.PI / 2 + (2 * Math.PI * i) / n;
         pos.push({ x: W / 2 + 160 * Math.cos(ang), y: H / 2 + 160 * Math.sin(ang), r: R });
@@ -292,7 +356,9 @@
     S.forEach((s, i) => {
       body += drawNode(pos[i], s, { double: accept.has(s) });
     });
-    return wrap(W, H, body + labels, 'Diagrama de autómata', W);
+    const tr = [...merged.values()].map((e) => `${e.a} con ${e.syms.join(' o ')} va a ${e.b}`);
+    const label = `Autómata con estados ${list(S)}; inicial ${f.start != null ? f.start : 'sin indicar'}; de aceptación ${accept.size ? list([...accept]) : 'ninguno'}.${tr.length ? ` Transiciones: ${tr.join('; ')}.` : ''}`;
+    return wrap(W, H, body + labels, label, W);
   }
 
   // ---------- cinta de máquina de Turing ----------
@@ -311,7 +377,8 @@
     const hx = PADX + f.head * C + C / 2;
     body += `<path d="M${hx},64 l-9,14 h18 z" class="fhead"/>`;
     if (f.state) body += t(hx, 92, String(f.state), 'fl fl-mono fl-b');
-    return wrap(W, H, body, 'Cinta de máquina de Turing', W);
+    const label = `Cinta de máquina de Turing con las celdas ${list(cells)}; la cabeza está en la celda ${f.head + 1} (${cells[f.head]})${f.state ? `, en el estado ${f.state}` : ''}.`;
+    return wrap(W, H, body, label, W);
   }
 
   // ---------- dendrograma ----------
@@ -360,7 +427,15 @@
     order.forEach((id) => {
       body += t(xOf[id], H - PADB + 18, f.leaves[id], 'fl');
     });
-    return wrap(W, H, body, 'Dendrograma', W);
+    // la fusión k forma el "grupo k"
+    const nm = f.leaves.map(String);
+    const fus = f.merges.map(([i, j, h], k) => {
+      const s = `${k + 1}) ${nm[i]} y ${nm[j]} a distancia ${h}`;
+      nm[n + k] = `grupo ${k + 1}`;
+      return s;
+    });
+    const label = `Dendrograma de ${list(f.leaves.map(String))}. Fusiones (la fusión k forma el grupo k): ${fus.join('; ')}.`;
+    return wrap(W, H, body, label, W);
   }
 
   // ---------- red neuronal por capas ----------
@@ -381,10 +456,76 @@
     }
     for (const layer of pos) for (const p of layer) body += drawNode(p, p.lab.length > 3 ? '' : p.lab) + (p.lab.length > 3 ? t(p.x, p.y, p.lab, 'fl fl-sm') : '');
     if (Array.isArray(f.labels)) f.labels.forEach((lab, k) => (body += t(80 + k * GAPX, H - 18, lab, 'fel fel-s')));
-    return wrap(W, H, body, 'Red neuronal', W);
+    const names = Array.isArray(f.labels) ? f.labels : [];
+    const label = `Red neuronal por capas, cada neurona conectada con todas las de la capa siguiente: ${L.map((l, k) => `${names[k] || `capa ${k + 1}`} (${list(l.map(String))})`).join('; ')}.`;
+    return wrap(W, H, body, label, W);
   }
 
   const KINDS = { tree, graph, automaton, tape, dendrogram, layers };
+
+  // Figura que el contenedor reduce a menos del 85 % (teléfono): se ofrece verla a tamaño natural. Se mide al
+  // aparecer y al cambiar de ancho (girar el teléfono, abrir el caso que la contiene).
+  function fit(f) {
+    const svg = f && f.querySelector('.fig-svg');
+    const b = f && f.querySelector('.fig-zoom');
+    if (!svg || !b) return;
+    const r = svg.getBoundingClientRect().width;
+    const small = r > 0 && r < Number(f.dataset.w) * 0.85;
+    f.classList.toggle('fig-small', small);
+    b.hidden = !small;
+  }
+  if (window.ResizeObserver && window.MutationObserver) {
+    // se observa el svg y no la figura: mostrar u ocultar el botón cambia la altura de la figura, no el ancho del svg
+    const RO = new ResizeObserver((es) => es.forEach((e) => fit(e.target.closest('.fig'))));
+    const live = new Set();
+    new MutationObserver((ms) => {
+      for (const svg of live) {
+        if (!svg.isConnected) {
+          RO.unobserve(svg);
+          live.delete(svg);
+        }
+      }
+      for (const m of ms) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          const fs = n.matches('.fig[data-w]') ? [n] : n.querySelectorAll('.fig[data-w]');
+          for (const f of fs) {
+            const svg = f.querySelector('.fig-svg');
+            if (!svg || live.has(svg)) continue;
+            live.add(svg);
+            RO.observe(svg);
+          }
+        }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  }
+  // Copia a tamaño natural en un diálogo; con ids propios, porque las flechas apuntan a su marcador por id y la
+  // vista de abajo puede volver a dibujarse mientras está abierto.
+  function zoom(el) {
+    const f = el.closest('.fig');
+    const svg = f && f.querySelector('.fig-svg');
+    if (!svg || !f.classList.contains('fig-small')) return;
+    const c = svg.cloneNode(true);
+    c.removeAttribute('data-act');
+    c.setAttribute('style', `width:${Number(f.dataset.w)}px;max-width:none`);
+    let html = c.outerHTML;
+    const m = c.querySelector('marker');
+    if (m) {
+      const nid = `fg${++seq}a`;
+      html = html.split(`id="${m.id}"`).join(`id="${nid}"`).split(`url(#${m.id})`).join(`url(#${nid})`);
+    }
+    EG.ui.modal({
+      title: 'Figura',
+      body: `<div class="fig-big" tabindex="0" role="region" aria-label="Figura a tamaño natural">${html}</div><p class="fig-hint muted" hidden>Desliza para recorrerla completa.</p>`,
+      actions: [{ id: 'ok', label: 'Cerrar', kind: 'primary' }],
+      cls: 'modal-fig',
+      mount(p) {
+        const box = p.querySelector('.fig-big');
+        const hint = p.querySelector('.fig-hint');
+        if (box && hint) hint.hidden = box.scrollWidth <= box.clientWidth + 2 && box.scrollHeight <= box.clientHeight + 2;
+      },
+    });
+  }
 
   EG.fig = {
     render(spec) {
@@ -396,5 +537,6 @@
         return '';
       }
     },
+    zoom,
   };
 })();

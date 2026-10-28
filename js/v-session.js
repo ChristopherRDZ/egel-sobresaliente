@@ -60,7 +60,8 @@
       const ok = S.grade(q, st.ans) === 1;
       return `<div class="num-res"><div class="${ok ? 'ok' : 'bad'}"><small>Tu respuesta</small><b>${esc(st.ans == null || st.ans === '' ? '—' : st.ans)}${unit}</b></div><div class="ok"><small>Respuesta correcta</small><b>${esc(q.answer)}${unit}</b></div></div>`;
     }
-    return `<div class="num"><label for="numIn">Captura tu respuesta</label><div class="num-row"><input id="numIn" class="num-in" type="text" inputmode="decimal" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(st.sel == null ? '' : st.sel)}" placeholder="Escribe tu resultado">${q.unit ? `<span class="num-unit">${esc(q.unit)}</span>` : ''}</div></div>`;
+    // inputmode text en todas: el teclado decimal del iPhone no trae signo menos, y variarlo por pregunta daría pistas
+    return `<div class="num"><label for="numIn">Captura tu respuesta</label><div class="num-row"><input id="numIn" class="num-in" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(st.sel == null ? '' : st.sel)}" placeholder="Escribe tu resultado">${q.unit ? `<span class="num-unit">${esc(q.unit)}</span>` : ''}</div></div>`;
   }
   function orderHtml(q, st) {
     if (st.revealed) {
@@ -76,7 +77,7 @@
     }
     const picked = toArr(st.sel);
     const target = picked
-      .map((oi, k) => `<li><button type="button" class="ord-item in" data-act="q-unpick" data-i="${oi}" aria-label="Quitar de la posición ${k + 1}"><span class="ord-n">${k + 1}</span><span class="rich">${EG.md.renderOption(q.options[oi])}</span>${ui.icon('x', 'ord-x')}</button></li>`)
+      .map((oi, k) => `<li><button type="button" class="ord-item in" data-act="q-unpick" data-i="${oi}" aria-label="${esc(`Quitar «${EG.md.plain(q.options[oi])}» de la posición ${k + 1}`)}"><span class="ord-n">${k + 1}</span><span class="rich">${EG.md.renderOption(q.options[oi])}</span>${ui.icon('x', 'ord-x')}</button></li>`)
       .join('');
     const slots = Array.from({ length: q.options.length - picked.length }, (_, k) => `<li class="ord-slot"><span class="ord-n">${picked.length + k + 1}</span></li>`).join('');
     const pool = st.order
@@ -91,13 +92,14 @@
     const skipped = st.ans == null || st.ans === '' || (Array.isArray(st.ans) && !st.ans.length);
     const head = skipped ? `${ui.icon('info')}<span>Sin responder</span>` : ok ? `${ui.icon('check')}<span>¡Correcto!</span>` : `${ui.icon('x')}<span>Incorrecto</span>`;
     let correctLine = '';
-    if (!ok && q.type === 'mc') correctLine = `<p class="fb-correct">Respuesta correcta: <b>${L[st.order.indexOf(q.answer)]})</b> <span class="rich">${EG.md.renderOption(q.options[q.answer])}</span></p>`;
-    if (!ok && q.type === 'multi') correctLine = `<p class="fb-correct">Respuestas correctas: ${q.answer.map((i) => `<b>${L[st.order.indexOf(i)]})</b>`).join(' y ')}</p>`;
+    // div y no p: una opción con bloque de código (figure) cerraría el <p> antes de tiempo
+    if (!ok && q.type === 'mc') correctLine = `<div class="fb-correct">Respuesta correcta: <b>${L[st.order.indexOf(q.answer)]})</b> <span class="rich">${EG.md.renderOption(q.options[q.answer])}</span></div>`;
+    if (!ok && q.type === 'multi') correctLine = `<div class="fb-correct">Respuestas correctas: ${q.answer.map((i) => `<b>${L[st.order.indexOf(i)]})</b>`).join(' y ')}</div>`;
     const guess = st.canGuess && ok ? `<button type="button" class="chip-btn${st.guessed ? ' on' : ''}" data-act="q-guess" aria-pressed="${!!st.guessed}" title="Marca si acertaste sin estar seguro: la pregunta volverá pronto a tu repaso">${ui.icon('eye')} Adiviné</button>` : '';
     const ask = EG.tutor && EG.tutor.available ? `<button type="button" class="chip-btn chip-claude" data-act="q-ask">${ui.icon('spark')} Pregúntale a Claude</button>` : '';
     const book = S.mark(q.id) && S.mark(q.id).m;
     return `<section class="fb ${skipped ? 'fb-skip' : ok ? 'fb-ok' : 'fb-bad'}" aria-live="polite">
-      <div class="fb-h">${head}</div>${correctLine}
+      <div class="fb-h" tabindex="-1">${head}</div>${correctLine}
       <div class="fb-why rich">${EG.md.render(q.why)}</div>
       <div class="fb-tip">${ui.icon('bulb')}<div class="rich">${EG.md.render(q.tip)}</div></div>
       ${q.src ? `<p class="fb-src">Para profundizar: ${esc(q.src)}</p>` : ''}
@@ -130,7 +132,23 @@
   EG.resumeSession = (id) => EG.router.go('session', { id });
 
   // ---------- corredor ----------
-  const RUN = { s: null, i: 0, st: null, qStart: 0, tick: null, saveT: 0, key: null };
+  // drafts: selección incompleta por pregunta (modo examen); elSaved: cronómetro ya guardado; ptr: ver onPtr
+  const RUN = { s: null, i: 0, st: null, qStart: 0, tick: null, saveT: 0, key: null, drafts: {}, elSaved: 0, ptr: false };
+  // una sincronización pudo traer respuestas a la sesión abierta (se fusionan en el mismo objeto): mostrarlas
+  S.on((why) => {
+    if (why !== 'remote' || !RUN.s) return;
+    const cur = S.session(RUN.s.id);
+    if (!cur) EG.router.go('home', {}, { root: true });
+    // calificada en otro dispositivo: no seguir respondiendo ni contando tiempo en ella
+    else if (cur.done) EG.router.go('results', { id: cur.id }, { replace: true });
+    else {
+      // la pregunta actual se respondió en otro dispositivo: mostrar esa respuesta y no pisarla con la selección vieja
+      const st = RUN.st;
+      const a = st && isAnswered(cur, st.qid) ? cur.it[st.qid][0] : null;
+      if (st && JSON.stringify(a) !== JSON.stringify(st.ans == null ? null : st.ans)) RUN.st = null;
+      rerender();
+    }
+  });
   const isAnswered = (s, qid) => {
     const it = s.it[qid];
     return !!it && it[0] != null && !(Array.isArray(it[0]) && !it[0].length) && it[0] !== '';
@@ -144,13 +162,18 @@
   function stateFor(s, i) {
     const qid = s.qs[i];
     const q = D.bank.get(qid);
+    // pregunta retirada del banco: runHtml muestra el aviso con "Continuar"
+    if (!q) {
+      RUN.st = null;
+      return { q: null, st: null };
+    }
     const it = s.it[qid];
     const answered = isAnswered(s, qid);
     if (!RUN.st || RUN.st.qid !== qid || RUN.st.sid !== s.id) {
       RUN.st = {
         qid,
         sid: s.id,
-        sel: answered ? clone(it[0]) : q.type === 'mc' || q.type === 'numeric' ? null : [],
+        sel: answered ? clone(it[0]) : RUN.drafts[qid] ? clone(RUN.drafts[qid]) : q.type === 'mc' || q.type === 'numeric' ? null : [],
         order: optOrder(s.sh, q),
         caseOpen: firstOfCase(s, i),
       };
@@ -213,7 +236,13 @@
   function runHtml() {
     const s = RUN.s;
     const { q, st } = stateFor(s, RUN.i);
-    if (!q) return `<div class="empty"><p>Esta pregunta ya no existe en el banco.</p><button class="btn btn-primary" data-act="run-next">Continuar</button></div>`;
+    if (!q) {
+      // que "Continuar" no confirme la pregunta anterior
+      CTX.q = null;
+      CTX.st = null;
+      CTX.s = s;
+      return `<div class="empty"><p>Esta pregunta ya no existe en el banco.</p><button class="btn btn-primary" data-act="run-next">Continuar</button></div>`;
+    }
     CTX.q = q;
     CTX.st = st;
     CTX.s = s;
@@ -223,8 +252,15 @@
     const el = U.$('#view');
     if (!el || !RUN.s) return;
     const y = window.scrollY;
+    // el HTML se reemplaza completo: conservar el foco del teclado y el desplazamiento del estímulo
+    const key = ui.focusKey(el);
+    const cb = U.$('.case-b', el);
+    const cbTop = cb && !(opts && opts.top) ? cb.scrollTop : 0;
     el.innerHTML = runHtml();
     afterRender();
+    const cb2 = cbTop ? U.$('.case-b', el) : null;
+    if (cb2) cb2.scrollTop = cbTop;
+    ui.restoreFocus(el, key, ['#runNext', '#runCheck:not(:disabled)', '.ord-pool button']);
     if (opts && opts.top) window.scrollTo(0, 0);
     else window.scrollTo(0, y);
     if (opts && opts.focusFb) {
@@ -236,6 +272,12 @@
     }
   }
   function afterRender() {
+    // recordar si el estudiante abrió o cerró el estímulo del caso (cada toque vuelve a dibujar la vista)
+    const det = U.$('.qcard details.case');
+    const st0 = RUN.st;
+    if (det && st0) det.addEventListener('toggle', () => {
+      if (RUN.st === st0) st0.caseOpen = det.open;
+    });
     const inp = U.$('#numIn');
     if (inp) {
       inp.addEventListener('input', () => {
@@ -265,7 +307,12 @@
     const q = CTX.q;
     const st = RUN.st;
     const val = selectionComplete(q, st) ? clone(st.sel) : null;
+    // la selección incompleta (ordenamiento o "elige dos") no se califica, pero se conserva al volver
+    if (val == null) RUN.drafts[q.id] = clone(st.sel);
+    else delete RUN.drafts[q.id];
     S.answer(s, q.id, val, elapsedQ());
+    // lo guardado aquí no cuenta como cambio de otro dispositivo (listener 'remote')
+    st.ans = val;
     RUN.qStart = performance.now();
   }
   function check() {
@@ -275,6 +322,9 @@
     if (!selectionComplete(q, st)) return;
     S.answer(s, q.id, clone(st.sel), elapsedQ());
     rerender({ focusFb: true });
+    // llevar el foco al resultado para que el lector de pantalla lo anuncie
+    const h = U.$('.fb-h');
+    if (h && h.focus) h.focus({ preventScroll: true });
   }
   function go(delta) {
     const s = RUN.s;
@@ -290,6 +340,7 @@
   }
   async function finishFlow(force) {
     const s = RUN.s;
+    if (!s) return;
     const missing = s.qs.filter((id) => !isAnswered(s, id)).length;
     if (!force && s.mode === 'exam') {
       const fl = s.fl.length;
@@ -324,12 +375,15 @@
   function startTick() {
     stopTick();
     const s = RUN.s;
+    if (!s) return;
+    RUN.elSaved = s.el;
     const exam = s.mode === 'exam';
     if (!exam && !S.settings().practiceTimer) return;
     let last = performance.now();
     RUN.tick = setInterval(() => {
       const now = performance.now();
-      const dt = now - last;
+      // un tic dura ~1 s: el salto tras congelar o suspender la página (teléfono) no cuenta, como el tiempo oculto
+      const dt = Math.min(now - last, 2000);
       last = now;
       if (document.visibilityState !== 'visible') return;
       const clock = U.$('#runClock b');
@@ -338,11 +392,15 @@
         if (Date.now() - RUN.saveT > 15000) {
           RUN.saveT = Date.now();
           S.touchSession(s);
+          RUN.elSaved = s.el;
         }
         if (clock) clock.textContent = U.fmtClock(s.lim ? s.lim - s.el : s.el);
         if (s.lim && s.lim - s.el <= 600000) U.$('#runClock') && U.$('#runClock').classList.add('warn');
         if (s.lim && s.el >= s.lim) {
           stopTick();
+          // cerrar mapa o diálogos abiertos y calificar también la numérica que se estaba escribiendo
+          while (ui.layers.length) ui.closeTop();
+          commitExamIfInput();
           ui.toast('Se terminó el tiempo del simulacro.');
           finishFlow(true);
         }
@@ -353,15 +411,29 @@
     if (RUN.tick) clearInterval(RUN.tick);
     RUN.tick = null;
   }
+  // la última interacción fue con el ratón o un toque (el clic deja el foco en la opción elegida)
+  function onPtr() {
+    RUN.ptr = true;
+  }
   function onKey(e) {
+    // cualquier tecla vuelve al modo teclado
+    const ptr = RUN.ptr;
+    RUN.ptr = false;
     if (EG.ui.layers.length || !RUN.s) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || e.ctrlKey || e.metaKey || e.altKey) return;
+    // Enter sobre un botón o enlace con foco: que lo active el navegador, no el atajo de avanzar; sobre la opción
+    // recién elegida con el ratón sí es el atajo (comprobar o avanzar)
+    if (e.key === 'Enter' && e.target && e.target.closest) {
+      const b = e.target.closest('button, a[href], summary, select, [contenteditable], [role=button]');
+      if (b && !(ptr && b.matches('[data-act="q-pick"], [data-act="q-unpick"]'))) return;
+    }
     const q = CTX.q;
     const st = RUN.st;
+    if (!st) return;
     const k = e.key.toLowerCase();
     const n = q && q.options ? q.options.length : 0;
-    const idx = '12345'.indexOf(k) >= 0 ? '12345'.indexOf(k) : 'abcde'.indexOf(k);
+    const idx = '123456'.indexOf(k) >= 0 ? '123456'.indexOf(k) : 'abcdef'.indexOf(k);
     if (idx >= 0 && idx < n && !st.revealed && k.length === 1) {
       e.preventDefault();
       pick(st.order[idx]);
@@ -414,6 +486,7 @@
       if (!s) return `<div class="empty"><p>Esta sesión ya no existe.</p><button class="btn btn-primary" data-act="nav" data-to="home">Ir al inicio</button></div>`;
       RUN.s = s;
       RUN.st = null;
+      RUN.drafts = {};
       RUN.i = U.clamp(s.pos || 0, 0, s.qs.length - 1);
       if (s.mode === 'tutor' && isAnswered(s, s.qs[RUN.i])) {
         const nxt = s.qs.findIndex((id) => !isAnswered(s, id));
@@ -424,12 +497,15 @@
     mount() {
       afterRender();
       document.addEventListener('keydown', onKey);
+      document.addEventListener('pointerdown', onPtr, true);
       startTick();
     },
     unmount() {
       stopTick();
       document.removeEventListener('keydown', onKey);
-      if (RUN.s) S.touchSession(RUN.s);
+      document.removeEventListener('pointerdown', onPtr, true);
+      // solo si el cronómetro avanzó desde el último guardado: entrar y salir no cuenta como cambio
+      if (RUN.s && RUN.s.el !== RUN.elSaved) S.touchSession(RUN.s);
       RUN.s = null;
       RUN.st = null;
     },
@@ -471,6 +547,8 @@
     S.toggleFlag(RUN.s, CTX.q.id);
     rerender();
   };
+  // figura reducida en teléfono (aquí y en la revisión de preguntas): verla a tamaño natural
+  A['fig-zoom'] = (el) => EG.fig.zoom(el);
   A['run-exit'] = async () => {
     const s = RUN.s;
     if (!s) return EG.router.back();
@@ -479,13 +557,17 @@
       S.discard(s);
       return EG.router.back('home');
     }
+    // con todo respondido lo pendiente es calificar: no prometer "continuar" y destacar Terminar
+    const all = nAns === s.qs.length;
     const v = await ui.modal({
       title: 'Salir de la sesión',
-      body: `<p>Tu avance quedó guardado (${nAns} de ${s.qs.length}). Puedes continuar después desde Inicio.</p>`,
+      body: all
+        ? `<p>Ya respondiste todas (${nAns} de ${s.qs.length}). Termina para ver tu calificación; si sales, puedes terminarla después desde Inicio.</p>`
+        : `<p>Tu avance quedó guardado (${nAns} de ${s.qs.length}). Puedes continuar después desde Inicio.</p>`,
       actions: [
         { id: 'stay', label: 'Seguir aquí' },
-        { id: 'finish', label: 'Terminar y calificar' },
-        { id: 'leave', label: 'Salir', kind: 'primary' },
+        { id: 'finish', label: 'Terminar y calificar', kind: all ? 'primary' : undefined },
+        { id: 'leave', label: 'Salir', kind: all ? undefined : 'primary' },
       ],
     });
     if (v === 'finish') finishFlow(s.mode === 'exam' ? false : true);
@@ -500,7 +582,8 @@
         const ans = isAnswered(s, id);
         const ok = ans && s.mode !== 'exam' ? S.grade(q, s.it[id][0]) === 1 : null;
         const cls = ['mapc', k === RUN.i ? 'cur' : '', ans ? 'ans' : '', ok === true ? 'ok' : ok === false ? 'bad' : '', s.fl.includes(id) ? 'fl' : ''].join(' ');
-        return `<button type="button" class="${cls}" data-act="run-jump" data-k="${k}" aria-label="Pregunta ${k + 1}">${k + 1}</button>`;
+        const state = `${ans ? (ok === true ? 'correcta' : ok === false ? 'incorrecta' : 'respondida') : 'sin responder'}${s.fl.includes(id) ? ', marcada' : ''}`;
+        return `<button type="button" class="${cls}" data-act="run-jump" data-k="${k}" aria-label="Pregunta ${k + 1}, ${state}"${k === RUN.i ? ' aria-current="true"' : ''}>${k + 1}</button>`;
       })
       .join('');
     const legend = s.mode === 'exam' ? '<span><i class="lg ans"></i>respondida</span><span><i class="lg fl"></i>marcada</span><span><i class="lg"></i>pendiente</span>' : '<span><i class="lg ok"></i>correcta</span><span><i class="lg bad"></i>incorrecta</span><span><i class="lg"></i>pendiente</span>';
@@ -508,7 +591,8 @@
   };
   A['run-jump'] = (el) => {
     ui.closeTop();
-    if (RUN.s && RUN.s.mode === 'exam') commitExamIfInput();
+    if (!RUN.s) return;
+    if (RUN.s.mode === 'exam') commitExamIfInput();
     const k = Number(el.dataset.k);
     RUN.i = k;
     S.setPos(RUN.s, k);
@@ -617,11 +701,13 @@
           .filter((a) => rep.areas[a.id])
           .map((a) => `<div class="area-row"><div class="area-row-h"><span class="dot" style="background:${ui.areaColor(a.id)}"></span><b>${esc(a.name)}</b><span class="muted">${Math.round(pa[a.id] * tot[a.id])}/${tot[a.id]} · ${U.pct(pa[a.id])}</span>${ui.levelPill(rep.areas[a.id].lvl, true)}</div>${ui.gauge(rep.areas[a.id].idx)}</div>`)
           .join('');
-        const g = rep.global;
+        // un simulacro parcial (una subárea o un área) no estima el resultado global ni la sección completa
+        const full = !!(rep.disc && rep.disc.complete);
+        const g = full ? rep.global : null;
         examBlock = `<section class="card">
           <h2 class="card-h">Nivel estimado</h2>
           ${g ? `<div class="global-lvl"><div>${ui.icon('medal')}</div><div><small>Resultado global estimado</small>${ui.levelPill(g)}${rep.lcMissing ? '<p class="muted small">Sin preguntas de Lenguaje y Comunicación: se supuso Satisfactorio en esa sección.</p>' : ''}</div></div>` : ''}
-          ${rep.disc ? `<p class="muted small">Sección disciplinar: índice ${rep.disc.idx} (${S.LEVEL_NAME[rep.disc.lvl]})${rep.lc ? ` · Lenguaje y Comunicación: ${rep.lc.idx} (${S.LEVEL_NAME[rep.lc.lvl]})` : ''}</p>` : ''}
+          ${full ? `<p class="muted small">Sección disciplinar: índice ${rep.disc.idx} (${S.LEVEL_NAME[rep.disc.lvl]})${rep.lc ? ` · Lenguaje y Comunicación: ${rep.lc.idx} (${S.LEVEL_NAME[rep.lc.lvl]})` : ''}</p>` : ''}
           <div class="area-rows">${rows}</div>
           <p class="note">${ui.icon('info')} Estimación orientativa: el Ceneval fija sus propios puntos de corte. Aquí se usa una meta exigente: 80% de aciertos ≈ 1150 (Sobresaliente) y 60% ≈ 1000 (Satisfactorio).</p>
         </section>`;

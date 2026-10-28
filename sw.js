@@ -1,5 +1,5 @@
 /* Service worker: la app funciona sin conexión después de la primera visita. */
-const VERSION = '2026-10-28T10:00:48.441Z';
+const VERSION = '2026-10-28T15:10:18.225Z-ef40f461b414';
 const CACHE = 'egel-' + VERSION;
 const ASSETS = ["./","css/app.css","data/meta.js","data/n-1.1.js","data/n-1.2.js","data/n-1.3.js","data/n-1.4.js","data/n-2.1.js","data/n-2.2.js","data/n-2.3.js","data/n-3.1.js","data/n-3.2.js","data/n-3.3.js","data/n-3.4.js","data/n-4.1.js","data/n-4.2.js","data/n-4.3.js","data/n-LC1.js","data/n-LC2.js","data/q-1.1.js","data/q-1.2.js","data/q-1.3.js","data/q-1.4.js","data/q-2.1.js","data/q-2.2.js","data/q-2.3.js","data/q-3.1.js","data/q-3.2.js","data/q-3.3.js","data/q-3.4.js","data/q-4.1.js","data/q-4.2.js","data/q-4.3.js","data/q-LC1.js","data/q-LC2.js","icons/apple-touch-icon.png","icons/icon-192.png","icons/icon-512.png","icons/icon-maskable-512.png","icons/icon.svg","index.html","js/data.js","js/fig.js","js/main.js","js/md.js","js/store.js","js/tutor.js","js/ui.js","js/util.js","js/v-guides.js","js/v-home.js","js/v-practice.js","js/v-progress.js","js/v-session.js","js/v-settings.js","manifest.webmanifest"];
 
@@ -7,7 +7,8 @@ self.addEventListener('install', (e) => {
   e.waitUntil(
     caches
       .open(CACHE)
-      .then((c) => c.addAll(ASSETS))
+      // cache: 'reload' evita guardar copias viejas de la caché HTTP (GitHub Pages cachea 10 min)
+      .then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
       .then(() => self.skipWaiting()),
   );
 });

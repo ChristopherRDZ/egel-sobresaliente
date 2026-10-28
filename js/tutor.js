@@ -27,7 +27,11 @@
 
   function describe(q, st) {
     const order = st && st.order ? st.order : (q.options || []).map((_, i) => i);
-    const opt = (i) => EG.md.plain(q.options[i]);
+    // Markdown original (plain() borraría operadores como > | * y aplanaría el código); el de varios renglones, aparte
+    const opt = (i) => {
+      const s = String(q.options[i]);
+      return s.includes('\n') ? '\n' + s : s;
+    };
     const lines = [];
     const cs = q.case ? D.cases.get(q.case) : null;
     const sub = D.sub(q.sub);
@@ -77,7 +81,9 @@ ${ctx}`;
   T.open = function (q, st) {
     if (!T.available) return;
     const key = q.id;
-    if (!T.chats.has(key)) T.chats.set(key, { turns: [], ctx: describe(q, st) });
+    // si cambió el orden de las opciones o la respuesta (otra sesión), la conversación empieza de nuevo
+    const ctxNow = describe(q, st);
+    if (!T.chats.has(key) || T.chats.get(key).ctx !== ctxNow) T.chats.set(key, { turns: [], ctx: ctxNow });
     const chat = T.chats.get(key);
     const ok = st && st.ans != null ? S.grade(q, st.ans) === 1 : null;
     ui.sheet({
@@ -133,7 +139,11 @@ ${ctx}`;
           } catch (e) {
             const code = e && e.code;
             if (e && e.text) chat.turns.push({ role: 'assistant', content: e.text + '\n\n*(Interrumpida)*' });
-            else chat.turns.pop();
+            else {
+              // sin respuesta: devolver la pregunta al cuadro para no perderla
+              chat.turns.pop();
+              if (!inp.value) inp.value = msg;
+            }
             const msgs = {
               cancelled: '',
               not_granted: 'No se permitió que esta app use a Claude. Puedes cambiarlo en los permisos del artifact.',

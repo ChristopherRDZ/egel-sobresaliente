@@ -27,14 +27,19 @@
   async function saveFile(name, text, mime) {
     const C = window.claude;
     if (C && typeof C.use === 'function') {
+      // dentro de claude.ai el marco no descarga por su cuenta: solo cuenta lo que confirme downloads
+      let dl = null;
       try {
-        const dl = await C.use('downloads');
-        if (dl) {
-          await dl.save({ filename: name, data: text });
-          return 'saved';
-        }
+        dl = await C.use('downloads');
       } catch (e) {
-        if (e && e.code === 'declined') return 'declined';
+        dl = null;
+      }
+      if (!dl) return 'error';
+      try {
+        await dl.save({ filename: name, data: text });
+        return 'saved';
+      } catch (e) {
+        return e && e.code === 'declined' ? 'declined' : 'error';
       }
     }
     try {
@@ -63,13 +68,15 @@
       const st = S.settings();
       const sync = S.sync;
       const syncHtml =
-        sync.mode === 'cloud'
+        sync.mode === 'cloud' && sync.error === 'quota'
+          ? `<div class="sync">${ui.icon('cloud')}<div><b>La nube está llena</b><span class="muted small">Tu progreso solo se guarda en este dispositivo y ya no llega a los demás. Exporta un respaldo para no perderlo.</span></div><button type="button" class="btn btn-sm btn-ghost" data-act="sync-now">Reintentar</button></div>`
+          : sync.mode === 'cloud'
           ? `<div class="sync on">${ui.icon('cloud')}<div><b>Sincronizado con tu cuenta de claude.ai</b><span class="muted small">Tu progreso aparece en cualquier dispositivo donde abras esta app con tu cuenta.${sync.last ? ` Última sincronización: ${esc(U.fmtDateTime(sync.last))}.` : ''}${sync.status === 'error' ? ' Hubo un problema de conexión; se reintentará.' : ''}</span></div><button type="button" class="btn btn-sm btn-ghost" data-act="sync-now">Sincronizar</button></div>`
           : `<div class="sync">${ui.icon('device')}<div><b>Guardado en este dispositivo</b><span class="muted small">${sync.error === 'readonly' ? 'Esta copia compartida no puede guardar en la nube; tu progreso se queda en este navegador.' : 'Tu progreso se guarda en este navegador.'} Para pasarlo a otro dispositivo usa Exportar e Importar.</span></div></div>`;
       const weakChips = D.meta.subs.map((s) => `<button type="button" class="chip-btn${(p.weak || []).includes(s.code) ? ' on' : ''}" data-act="set-weak" data-sub="${esc(s.code)}" aria-pressed="${(p.weak || []).includes(s.code)}"><b>${esc(s.code)}</b> ${esc(s.short || s.name)}</button>`).join('');
       const reported = S.reported();
       const repList = reported.length
-        ? `<ol class="qrows">${reported.map((id) => { const q = D.bank.get(id); const r = S.mark(id).r; return `<li><button type="button" class="qrow" data-act="open-q" data-qid="${esc(id)}">${q ? ui.subChip(q.sub, { short: true }) : ''}<span class="qrow-t"><b>${esc(id)}</b> · ${esc(r.reason)}${r.text ? ` — ${esc(r.text.slice(0, 90))}` : ''}</span></button></li>`; }).join('')}</ol><button type="button" class="btn btn-sm btn-ghost" data-act="export-reports">${ui.icon('download')}<span>Exportar reportes</span></button>`
+        ? `<ol class="qrows">${reported.map((id) => { const q = D.bank.get(id); const r = S.mark(id).r; return `<li><button type="button" class="qrow" data-act="open-q" data-qid="${esc(id)}">${q ? ui.subChip(q.sub, { short: true }) : ''}<span class="qrow-t"><b>${esc(id)}</b> · ${esc(r.reason)}${r.text ? ` — ${esc(String(r.text).slice(0, 90))}` : ''}</span></button></li>`; }).join('')}</ol><button type="button" class="btn btn-sm btn-ghost" data-act="export-reports">${ui.icon('download')}<span>Exportar reportes</span></button>`
         : '<p class="muted small">No has reportado preguntas. Si encuentras un error, usa "Reportar error" en la retroalimentación.</p>';
       const counts = D.meta.areas.map((a) => {
         const n = D.meta.subs.filter((s) => s.area === a.id).reduce((acc, s) => acc + (D.bySub.get(s.code) || []).length, 0);
@@ -91,7 +98,7 @@
           ${toggle('setTimer', st.practiceTimer, 'Cronómetro en práctica', 'Muestra el tiempo por pregunta (meta: ~2.4 min).')}
         </div></section>
         <section class="card"><h2 class="card-h">Tus datos</h2>${syncHtml}
-          <div class="btn-row"><button type="button" class="btn btn-ghost" data-act="export">${ui.icon('download')}<span>Exportar progreso</span></button><label class="btn btn-ghost" for="importFile">${ui.icon('upload')}<span>Importar progreso</span></label><input type="file" id="importFile" accept=".json,application/json" hidden></div>
+          <div class="btn-row"><button type="button" class="btn btn-ghost" data-act="export">${ui.icon('download')}<span>Exportar progreso</span></button><button type="button" class="btn btn-ghost" data-act="import">${ui.icon('upload')}<span>Importar progreso</span></button><input type="file" id="importFile" accept=".json,application/json" hidden></div>
           <p class="muted small">Importar combina el archivo con tu progreso actual; no borra nada.</p>
           <div class="danger"><button type="button" class="btn btn-danger" data-act="reset">${ui.icon('trash')}<span>Borrar todo mi progreso</span></button></div>
         </section>
@@ -161,14 +168,21 @@
     S.flushSync();
     EG.router.refresh();
   };
+  // botón (no <label>) para que también se pueda abrir con el teclado
+  A.import = () => {
+    const i = U.$('#importFile');
+    if (i) i.click();
+  };
   A.export = async () => {
     const r = await saveFile(`egel-progreso-${U.dayKey(Date.now())}.json`, S.exportData());
     if (r === 'saved') ui.toast('Respaldo listo.');
-    else if (r === 'error') ui.toast('No se pudo generar el archivo.', 'bad');
+    else if (r === 'error') ui.toast('No se pudo descargar el respaldo.', 'bad');
   };
   A['export-reports'] = async () => {
     const rows = S.reported().map((id) => ({ id, ...S.mark(id).r }));
-    await saveFile(`egel-reportes-${U.dayKey(Date.now())}.json`, JSON.stringify(rows, null, 1));
+    const r = await saveFile(`egel-reportes-${U.dayKey(Date.now())}.json`, JSON.stringify(rows, null, 1));
+    if (r === 'saved') ui.toast('Reportes exportados.');
+    else if (r === 'error') ui.toast('No se pudo descargar el archivo de reportes.', 'bad');
   };
   A.reset = async () => {
     const v = await ui.modal({
@@ -180,9 +194,10 @@
       ],
     });
     if (v !== 'del') return;
-    await S.reset();
+    const ok = await S.reset();
     EG.applySettings();
     if (EG.resetWelcome) EG.resetWelcome();
     EG.router.go('welcome', {}, { root: true });
+    if (!ok) ui.toast('No se pudo borrar todavía la copia en la nube; se reintentará al sincronizar.', 'bad');
   };
 })();

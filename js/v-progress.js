@@ -26,7 +26,7 @@
       const x = PL + k * step + step * 0.18;
       const w = step * 0.64;
       const h = Math.max(0, y(0) - y(d.n));
-      if (d.n) s += `<rect x="${x.toFixed(1)}" y="${y(d.n).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="2" class="ch-bar${d.n >= goal ? ' hit' : ''}"><title>${esc(U.fmtShort(d.t))}: ${d.n} preguntas, ${d.c} correctas</title></rect>`;
+      if (d.n) s += `<rect x="${x.toFixed(1)}" y="${y(d.n).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="2" class="ch-bar${d.n >= goal ? ' hit' : ''}"><title>${esc(U.fmtShort(d.t))}: ${d.n} preguntas, ${d.c} correctas${d.p ? ` (${d.p} sin calificar)` : ''}</title></rect>`;
       if (k % 5 === 0 || k === days.length - 1) s += `<text x="${(x + w / 2).toFixed(1)}" y="${H - 8}" class="ch-ax" text-anchor="middle">${esc(U.fmtShort(d.t))}</text>`;
     });
     s += `<line x1="${PL}" x2="${W - 4}" y1="${y(goal)}" y2="${y(goal)}" class="ch-goal"/><text x="${W - 6}" y="${y(goal) - 7}" class="ch-ax ch-goal-t" text-anchor="end">meta ${goal}</text>`;
@@ -57,7 +57,7 @@
       const T = S.derived.totals;
       const unique = S.derived.q.size;
       const rd = S.readiness();
-      const goal = S.profile().dailyGoal || 40;
+      const goal = Number(S.profile().dailyGoal) || 40;
       const areaRows = D.meta.areas
         .map((a) => {
           const st = S.areaStats(a.id);
@@ -82,21 +82,25 @@
       for (let k = 29; k >= 0; k--) {
         const t = U.addDays(Date.now(), -k);
         const d = S.derived.daily.get(U.dayKey(t)) || { n: 0, c: 0 };
-        days.push({ t, n: d.n, c: d.c });
+        // p: respuestas de un simulacro sin calificar (cuentan en n, todavía no en c)
+        days.push({ t, n: d.n, c: d.c, p: d.p || 0 });
       }
       const sims = S.sessions()
         .filter((s) => (s.k === 'exam' || s.k === 'diag') && s.done)
         .reverse()
         .map((s) => {
           const { rep } = EG.sessionReport(s);
-          return { t: s.t0, idx: rep.disc ? rep.disc.idx : 700, lvl: rep.global, s };
+          // solo un simulacro de toda la sección disciplinar da índice disciplinar y nivel global
+          const full = !!(rep.disc && rep.disc.complete);
+          return { t: s.t0, idx: rep.disc ? rep.disc.idx : null, lc: rep.lc ? rep.lc.idx : null, full, lvl: full ? rep.global : null, s };
         });
+      const label = (m) => (m.idx != null ? `${m.full ? 'índice disciplinar' : 'índice de las áreas evaluadas'} ${m.idx}` : m.lc != null ? `Lenguaje y Comunicación ${m.lc}` : 'sin índice');
       const simList = sims.length
         ? `<ol class="hist">${sims
             .slice()
             .reverse()
             .slice(0, 8)
-            .map((m) => `<li><button type="button" class="hist-row" data-act="nav" data-to="results" data-p='${esc(JSON.stringify({ id: m.s.id }))}'><span class="hist-ic">${ui.icon(m.s.k === 'diag' ? 'target' : 'timer')}</span><span class="hist-b"><b>${esc(m.s.title)}</b><span class="muted small">${esc(U.fmtDateTime(m.t))} · índice disciplinar ${m.idx}</span></span>${m.lvl ? ui.levelPill(m.lvl, true) : ''}${ui.icon('right')}</button></li>`)
+            .map((m) => `<li><button type="button" class="hist-row" data-act="nav" data-to="results" data-p='${esc(JSON.stringify({ id: m.s.id }))}'><span class="hist-ic">${ui.icon(m.s.k === 'diag' ? 'target' : 'timer')}</span><span class="hist-b"><b>${esc(m.s.title)}</b><span class="muted small">${esc(U.fmtDateTime(m.t))} · ${label(m)}</span></span>${m.lvl ? ui.levelPill(m.lvl, true) : ''}${ui.icon('right')}</button></li>`)
             .join('')}</ol>`
         : '<p class="muted">Haz un diagnóstico o un simulacro para ver tu evolución.</p>';
       return `<div class="page">
@@ -111,7 +115,7 @@
           <p class="note">${ui.icon('info')} El Índice Ceneval va de 700 a 1300; 1000 es Satisfactorio y 1150 Sobresaliente. Esta estimación usa tu última respuesta en cada pregunta vista y una meta exigente (80% ≈ 1150). Para el Sobresaliente global necesitas Sobresaliente en la sección disciplinar y al menos Satisfactorio en Lenguaje y Comunicación.</p></section>
         <section class="card"><h2 class="card-h">Dominio por tema</h2><p class="muted small">Cada cuadro es un tema; toca uno para practicarlo.</p><div class="hm-legend"><span><i class="hm h0"></i>sin datos</span><span><i class="hm h1"></i>&lt;40%</span><span><i class="hm h2"></i>40–59%</span><span><i class="hm h3"></i>60–79%</span><span><i class="hm h4"></i>80%+</span></div><div class="heat">${heat}</div></section>
         <section class="card"><h2 class="card-h">Actividad · últimos 30 días</h2>${activityChart(days, goal)}</section>
-        <section class="card"><h2 class="card-h">Diagnóstico y simulacros</h2>${simChart(sims)}${simList}</section>
+        <section class="card"><h2 class="card-h">Diagnóstico y simulacros</h2>${simChart(sims.filter((m) => m.full))}${simList}</section>
       </div>`;
     },
   };

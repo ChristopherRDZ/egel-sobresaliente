@@ -16,7 +16,10 @@
     let title = o.title;
     if (!title) {
       if (o.topics && o.topics.length === 1) {
-        const [code, tid] = o.topics[0].split('.');
+        // la clave es "código.tema" y el código puede llevar punto (2.1.t03)
+        const k = o.topics[0].lastIndexOf('.');
+        const code = o.topics[0].slice(0, k);
+        const tid = o.topics[0].slice(k + 1);
         const t = D.topic(code, tid);
         title = `${code} · ${t ? t.name : 'Tema'}`;
       } else if (subs.length === 1) title = `${subs[0]} · ${D.sub(subs[0]).short || D.sub(subs[0]).name}`;
@@ -35,7 +38,8 @@
       ui.toast('No tienes repasos pendientes. ¡Practica temas nuevos!');
       return null;
     }
-    const qs = S.pick({ ids, n: n || 20, filter: 'all', keepCases: false });
+    // 'smart' prioriza las falladas y las adivinadas sobre el resto de las pendientes
+    const qs = S.pick({ ids, n: n || 20, filter: 'smart', keepCases: false });
     return EG.startSession({ kind: 'review', title, mode: 'tutor', qs });
   };
   EG.startDiag = function () {
@@ -138,6 +142,12 @@
     el.classList.toggle('on');
     el.setAttribute('aria-pressed', String(WELCOME.weak.has(c)));
   };
+  // botón Atrás del sistema en la bienvenida: un paso atrás; false si ya está en el primero
+  EG.welcomeBack = () => {
+    if (!WELCOME.step) return false;
+    A['wel-prev']();
+    return true;
+  };
   A['wel-finish'] = (el) => {
     S.setProfile({ name: WELCOME.name, examDate: WELCOME.date, dailyGoal: WELCOME.goal, weak: [...WELCOME.weak], onboarded: true });
     EG.router.go('home', {}, { root: true });
@@ -165,7 +175,9 @@
     }
     if (task.type === 'exam') {
       const cfg = S.EXAMS[task.kind];
-      return `<li class="task task-exam${prog.exam ? ' done' : ''}"><span class="task-ic">${ui.icon(prog.exam ? 'check' : 'timer')}</span><div class="task-b"><b>${esc(cfg.name)}</b><span class="muted">${esc(cfg.desc)}</span></div>${prog.exam ? '' : `<button type="button" class="btn btn-sm" data-act="start-exam" data-kind="${esc(task.kind)}">Empezar</button>`}</li>`;
+      // hecha con un simulacro de ese tipo (o el completo); un mini simulacro o uno de un área no la cumplen
+      const done = prog.exams.has(task.kind) || prog.exams.has('completo');
+      return `<li class="task task-exam${done ? ' done' : ''}"><span class="task-ic">${ui.icon(done ? 'check' : 'timer')}</span><div class="task-b"><b>${esc(cfg.name)}</b><span class="muted">${esc(cfg.desc)}</span></div>${done ? '' : `<button type="button" class="btn btn-sm" data-act="start-exam" data-kind="${esc(task.kind)}">Empezar</button>`}</li>`;
     }
     if (task.type === 'light') return `<li class="task"><span class="task-ic">${ui.icon('book')}</span><div class="task-b"><b>Repaso ligero</b><span class="muted">Relee las "Trampas frecuentes" de tus subáreas más débiles y descansa bien.</span></div><button type="button" class="btn btn-sm" data-act="nav" data-to="guides">Guías</button></li>`;
     return '';
@@ -294,7 +306,7 @@
         })
         .join('');
       return `<div class="page">
-        <header class="page-h"><div><p class="eyebrow">${plan.L} días hasta el examen${examT ? ` · ${esc(U.fmtLong(examT))}` : ''}</p><h1>Plan de estudio</h1><p class="muted">Cada día combina dos subáreas de áreas distintas y tu repaso espaciado. Las subáreas donde fallas más, y las que marcaste como difíciles, aparecen más veces. El plan se recalcula cada día con tu avance; la meta diaria es de ${p.dailyGoal} preguntas.</p></div></header>
+        <header class="page-h"><div><p class="eyebrow">${plan.L} días hasta el examen${examT ? ` · ${esc(U.fmtLong(examT))}` : ''}</p><h1>Plan de estudio</h1><p class="muted">Cada día combina dos subáreas de áreas distintas y tu repaso espaciado. Las subáreas donde fallas más, y las que marcaste como difíciles, aparecen más veces. El plan se recalcula cada día con tu avance; la meta diaria es de ${Number(p.dailyGoal) || 40} preguntas.</p></div></header>
         <ol class="plan">${rows}<li class="plan-day plan-exam"><div class="plan-date"><b>${examT ? esc(U.fmtDow(examT)) : ''}</b><span>${examT ? esc(U.fmtShort(examT)) : ''}</span></div><div class="plan-items"><span class="plan-t plan-e">${ui.icon('medal')} Examen EGEL Plus COMPU</span></div></li></ol>
         <div class="btn-row"><button type="button" class="btn btn-ghost" data-act="nav" data-to="settings">Cambiar fecha o meta diaria</button></div>
       </div>`;

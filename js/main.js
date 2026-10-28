@@ -51,7 +51,7 @@
     if (!el || !EG.store.state) return;
     const left = EG.store.daysLeft();
     const sync = EG.store.sync;
-    const syncTxt = sync.mode === 'cloud' ? (sync.status === 'syncing' ? 'Sincronizando…' : sync.status === 'error' ? 'Sin conexión; se reintentará' : 'Sincronizado') : 'Guardado en este dispositivo';
+    const syncTxt = sync.mode === 'cloud' ? (sync.error === 'quota' ? 'La nube está llena: tu progreso solo se guarda en este dispositivo' : sync.status === 'syncing' ? 'Sincronizando…' : sync.status === 'error' ? 'Sin conexión; se reintentará' : 'Sincronizado') : 'Guardado en este dispositivo';
     el.innerHTML = `${left != null && left >= 0 ? `<div class="side-count"><b>${left}</b><span>${left === 1 ? 'día para' : 'días para'} el examen</span></div>` : ''}<div class="side-sync">${ui.icon(sync.mode === 'cloud' ? 'cloud' : 'device')}<span>${syncTxt}</span></div>`;
   }
   EG.updateSide = updateSide;
@@ -66,47 +66,128 @@
   }
 
   function onChange(why) {
-    if (why === 'settings') EG.applySettings();
+    // tema y tamaño de texto también al importar un respaldo o al llegar de otro dispositivo
+    if (why === 'settings' || why === 'import' || why === 'remote') EG.applySettings();
     if (why === 'remote') {
       const cur = R.cur && R.cur.name;
       if (cur && !['session', 'welcome'].includes(cur)) R.refresh();
       if (cur === 'welcome' && EG.store.profile().onboarded) R.go('home', {}, { root: true });
+      // "Borrar todo" en otro dispositivo (o el navegador lo usa otra cuenta): de vuelta a la bienvenida
+      else if (cur && cur !== 'welcome' && !EG.store.profile().onboarded) {
+        if (EG.resetWelcome) EG.resetWelcome();
+        R.go('welcome', {}, { root: true });
+      }
     }
     updateSide();
   }
 
+  // Botón Atrás del sistema: en la PWA y también en una pestaña normal (no dentro de claude.ai).
   function setupHistory() {
-    if (U.isFramed || !U.isStandalone()) return;
+    if (U.isFramed) return;
     R.usesHistory = true;
     try {
-      history.replaceState({ n: 0 }, '');
+      // tras recargar a media navegación, volver a la entrada base para no heredar entradas sin vista
+      const n = R.depth();
+      if (n > 0) R.histGo(-n);
+      // la posición al volver la restaura R.back: sin la restauración del navegador, que la pisaría. Se fija ya en la
+      // entrada base, porque cada entrada nueva hereda el modo de la actual
+      R.hist(() => {
+        history.replaceState({ n: 0 }, '');
+        history.scrollRestoration = 'manual';
+      });
     } catch (e) {
       R.usesHistory = false;
       return;
     }
-    window.addEventListener('popstate', () => {
+    const onPop = () => {
+      if (R.pendingBack) {
+        const to = R.pendingBack;
+        R.pendingBack = null;
+        R.back(to, true);
+        return;
+      }
       if (ui.layers.length) {
         ui.closeTop();
-        history.pushState({ n: 1 }, '');
+        history.pushState({ n: R.depth() + 1 }, '');
         return;
       }
       if (R.cur && R.cur.name === 'session') {
-        history.pushState({ n: 1 }, '');
+        history.pushState({ n: R.depth() + 1 }, '');
         EG.actions['run-exit']();
         return;
       }
-      if (R.stack.length) R.back();
+      // en la bienvenida, Atrás regresa un paso sin saltarla; en el primero queda en la entrada base
+      if (R.cur && R.cur.name === 'welcome') {
+        if (EG.welcomeBack && EG.welcomeBack()) history.pushState({ n: R.depth() + 1 }, '');
+        return;
+      }
+      if (R.stack.length) R.back(null, true);
       else if (R.cur && R.cur.name !== 'home') R.go('home', {}, { root: true, fromPop: true });
+    };
+    window.addEventListener('popstate', () => {
+      // provocado por la app: history.go() de la navegación raíz o R.back() desde el código
+      if (R.ownPop()) return;
+      // Adelante del navegador: la entrada quedó más arriba de la que dejó la app; regresar sin cambiar la vista
+      if (R.depth() > R.at) {
+        R.histGo(R.at - R.depth());
+        return;
+      }
+      onPop();
+      // también las entradas que agregan el diálogo, la sesión y la bienvenida
+      R.at = R.depth();
     });
-    EG.actions.back = () => history.back();
+  }
+
+  // Aviso de versión nueva: se escucha desde que carga el script, porque el SW nuevo puede activarse antes de que
+  // termine el arranque; el diálogo espera a que la app esté lista. La página sigue con la versión anterior hasta recargar.
+  const SW = { had: false, changed: false, ready: false, shown: false, checked: 0 };
+  if (!U.isFramed && 'serviceWorker' in navigator) {
+    SW.had = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      SW.changed = true;
+      offerReload();
+    });
+  }
+  async function offerReload() {
+    // en la primera visita no había versión anterior: no hay nada que avisar
+    if (!SW.had || !SW.changed || !SW.ready || SW.shown) return;
+    SW.shown = true;
+    const v = await ui.modal({
+      title: 'Nueva versión disponible',
+      body: '<p>Se actualizó el banco de preguntas o la app. Tu progreso se conserva.</p>',
+      actions: [
+        { id: 'reload', label: 'Actualizar ahora', kind: 'primary' },
+        { id: 'later', label: 'Más tarde' },
+      ],
+    });
+    if (v === 'reload') {
+      EG.store.flushSync();
+      location.reload();
+    }
   }
 
   function registerSW() {
     if (U.isFramed || !('serviceWorker' in navigator) || !/^https?:$/.test(location.protocol)) return;
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    SW.ready = true;
+    offerReload();
+    navigator.serviceWorker
+      .register('sw.js')
+      .then((reg) => {
+        SW.checked = Date.now();
+        // la PWA puede quedarse abierta días sin navegar: al volver a verla, buscar versión nueva (como máximo cada hora)
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible' && Date.now() - SW.checked > 3600000) {
+            SW.checked = Date.now();
+            reg.update().catch(() => {});
+          }
+        });
+      })
+      .catch(() => {});
   }
 
   async function boot() {
+    // el Artifact se publica sin <html lang>: declarar el idioma para los lectores de pantalla
+    if (!document.documentElement.lang) document.documentElement.lang = 'es-MX';
     const early = U.storage.get('egel-sobresaliente:v1', null);
     const theme = early && early.main && early.main.settings && early.main.settings.theme;
     EG.hostTheme = document.documentElement.getAttribute('data-theme');
@@ -122,15 +203,19 @@
     EG.applySettings();
     EG.store.on(onChange);
     setupHistory();
+    // en claude.ai el perfil puede estar ya en la nube: esperar la primera sincronización antes de ofrecer la bienvenida
+    const sync = EG.store.initSync();
+    if (window.claude && !EG.store.profile().onboarded) await Promise.race([sync.catch(() => {}), new Promise((r) => setTimeout(r, 8000))]);
     const onboarded = EG.store.profile().onboarded;
-    R.go(onboarded ? 'home' : 'welcome', {}, { root: true });
+    // la bienvenida va encima de la entrada base, para que Atrás regrese un paso (EG.welcomeBack) sin salir de la app
+    R.go(onboarded ? 'home' : 'welcome', {}, { root: true, replace: onboarded });
     updateSide();
     const bootEl = U.$('#boot');
     if (bootEl) {
       bootEl.classList.add('done');
       setTimeout(() => bootEl.remove(), 400);
     }
-    EG.store.initSync().then(() => updateSide());
+    sync.then(updateSide, updateSide);
     EG.tutor.init().then(() => {
       if (EG.tutor.available && R.cur && R.cur.name === 'session') R.refresh();
     });

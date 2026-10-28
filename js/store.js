@@ -4,7 +4,9 @@
   'use strict';
   const EG = window.EG;
   const U = EG.U;
-  const KEY = 'egel-sobresaliente:v1';
+  const BASE_KEY = 'egel-sobresaliente:v1';
+  // clave local: la base, o una propia si el navegador lo comparte otra cuenta de claude.ai (ver initSync)
+  let KEY = BASE_KEY;
   const HOUR = 3600000;
   const DAY = 86400000;
   // Intervalos de repaso por caja (Leitner): 0 = fallada, 1 = adivinada, 2..5 = dominio creciente.
@@ -32,6 +34,8 @@
       v: 1,
       main: {
         u: 0,
+        // momento del último "Borrar todo": lo anterior se descarta también al sincronizar
+        resetAt: 0,
         profile: { name: '', examDate: '', dailyGoal: 40, weak: [], onboarded: false, created: Date.now() },
         settings: { theme: 'system', text: 1, shuffle: true, oneTap: false, practiceTimer: false },
         read: {},
@@ -39,25 +43,70 @@
       marks: { u: 0, q: {} },
       ses: {},
       plan: null,
+      // ya hubo un pull exitoso en este dispositivo (antes, el perfil configurado en la nube gana al local)
+      syncedOnce: false,
     };
+  }
+
+  // ---------- validación (datos de la nube o de un respaldo importado) ----------
+  const isObj = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+  function cleanProfile(p) {
+    const o = Object.assign(defaults().main.profile, isObj(p) ? p : {});
+    const meta = EG.data && EG.data.meta;
+    const codes = meta ? new Set(meta.subs.map((s) => s.code).concat(meta.areas.map((a) => a.id))) : null;
+    o.name = String(o.name == null ? '' : o.name).slice(0, 40);
+    o.examDate = /^\d{4}-\d{2}-\d{2}$/.test(o.examDate) ? o.examDate : '';
+    o.dailyGoal = U.clamp(Math.round(Number(o.dailyGoal)) || 40, 10, 300);
+    o.weak = Array.isArray(o.weak) ? o.weak.filter((c) => typeof c === 'string' && (!codes || codes.has(c))) : [];
+    o.onboarded = !!o.onboarded;
+    return o;
+  }
+  function cleanSettings(st) {
+    const o = Object.assign(defaults().main.settings, isObj(st) ? st : {});
+    if (!['system', 'light', 'dark'].includes(o.theme)) o.theme = 'system';
+    o.text = [1, 1.12, 1.25].includes(Number(o.text)) ? Number(o.text) : 1;
+    for (const k of ['shuffle', 'oneTap', 'practiceTimer']) o[k] = !!o[k];
+    return o;
+  }
+  const validMark = (m) => isObj(m) && (m.r == null || (isObj(m.r) && typeof m.r.reason === 'string' && (m.r.text == null || typeof m.r.text === 'string')));
+  // Sesión con la forma que usan las vistas; null si no sirve (archivo editado o de otra versión).
+  function cleanSession(s) {
+    if (!isObj(s) || typeof s.id !== 'string' || !Array.isArray(s.qs) || !s.qs.every((x) => typeof x === 'string')) return null;
+    if (!isObj(s.it) || !Number.isFinite(s.t0)) return null;
+    for (const k of Object.keys(s.it)) if (!Array.isArray(s.it[k])) delete s.it[k];
+    if (!Array.isArray(s.fl)) s.fl = [];
+    return s;
   }
 
   // ---------- carga y guardado local ----------
   function sanitize(st) {
     const d = defaults();
-    if (!st || typeof st !== 'object' || st.v !== 1) return d;
-    st.main = Object.assign(d.main, st.main || {});
-    st.main.profile = Object.assign(d.main.profile, st.main.profile || {});
-    st.main.settings = Object.assign(d.main.settings, st.main.settings || {});
-    st.main.read = st.main.read || {};
-    st.marks = Object.assign(d.marks, st.marks || {});
-    st.marks.q = st.marks.q || {};
-    st.ses = st.ses || {};
+    if (!isObj(st) || st.v !== 1) return d;
+    st.main = Object.assign(d.main, isObj(st.main) ? st.main : {});
+    st.main.profile = cleanProfile(st.main.profile);
+    st.main.settings = cleanSettings(st.main.settings);
+    st.main.read = isObj(st.main.read) ? st.main.read : {};
+    // guardado por la versión anterior (sin syncedOnce): si ya se usaba, no es un dispositivo nuevo
+    if (st.syncedOnce === undefined) st.syncedOnce = (Number(st.main.u) || 0) > 0;
+    st.marks = Object.assign(d.marks, isObj(st.marks) ? st.marks : {});
+    st.marks.q = isObj(st.marks.q) ? st.marks.q : {};
+    for (const [id, m] of Object.entries(st.marks.q)) if (!validMark(m)) delete st.marks.q[id];
+    st.ses = isObj(st.ses) ? st.ses : {};
+    for (const [id, s] of Object.entries(st.ses)) if (!cleanSession(s)) delete st.ses[id];
     return st;
   }
+  let hideHooked = false;
   S.load = function () {
     S.state = sanitize(U.storage.get(KEY, null));
     S.recompute();
+    if (!hideHooked) {
+      hideHooked = true;
+      // guardar al ocultar o cerrar la app (la PWA puede descartarse sin aviso); en la nube sube lo pendiente
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') S.flushSync();
+      });
+      window.addEventListener('pagehide', () => S.flushSync());
+    }
   };
   const saveLocal = U.debounce(() => U.storage.set(KEY, S.state), 300);
   S.saveNow = () => saveLocal.flush();
@@ -79,9 +128,12 @@
   S.profile = () => S.state.main.profile;
   S.settings = () => S.state.main.settings;
   S.setProfile = (patch) => {
+    const welcome = !!patch.onboarded && !S.state.main.profile.onboarded;
     Object.assign(S.state.main.profile, patch);
     S.state.plan = null;
     touch('main');
+    // main.u que dejó la bienvenida: mientras no cambie, el perfil y los ajustes son los de partida (ver importData)
+    if (welcome) S.state.main.welcomeAt = S.state.main.u;
     emit('profile');
   };
   S.setSettings = (patch) => {
@@ -90,12 +142,12 @@
     emit('settings');
   };
   S.markRead = (key, on) => {
-    if (on) S.state.main.read[key] = Date.now();
-    else delete S.state.main.read[key];
+    // desmarcar deja una lápida (tiempo negativo) para que no regrese desde otro dispositivo
+    S.state.main.read[key] = on ? Date.now() : -Date.now();
     touch('main');
     emit('read');
   };
-  S.isRead = (key) => !!S.state.main.read[key];
+  S.isRead = (key) => (S.state.main.read[key] || 0) > 0;
 
   // ---------- marcas por pregunta (guardada, reporte) ----------
   S.mark = (qid) => S.state.marks.q[qid] || null;
@@ -127,8 +179,9 @@
 
   // ---------- calificación ----------
   function cleanNum(s) {
-    let t = String(s).trim().toLowerCase().replace(/\s+/g, '');
-    if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');
+    let t = String(s).trim().toLowerCase().replace(/\s+/g, '').replace(/\u2212/g, '-').replace(/[%$]/g, '');
+    // coma de miles solo si el primer grupo no empieza en 0 ("0,343" es decimal)
+    if (/^-?[1-9]\d{0,2}(,\d{3})+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');
     else if (/^-?\d+,\d+$/.test(t)) t = t.replace(',', '.');
     return t;
   }
@@ -166,9 +219,11 @@
   };
 
   // ---------- sesiones ----------
-  S.sessions = () => Object.values(S.state.ses).sort((a, b) => b.t0 - a.t0);
-  S.session = (id) => S.state.ses[id] || null;
-  S.activeSession = () => S.sessions().find((s) => !s.done && s.qs.some((id) => !(s.it[id] && s.it[id][0] != null)) && Date.now() - (s.u || s.t0) < 21 * DAY) || null;
+  // las descartadas quedan como lápida (del) para la sincronización, pero no se muestran
+  S.sessions = () => Object.values(S.state.ses).filter((s) => !s.del).sort((a, b) => b.t0 - a.t0);
+  S.session = (id) => (S.state.ses[id] && !S.state.ses[id].del ? S.state.ses[id] : null);
+  // toda sesión sin terminar es reanudable, aunque ya tenga todas las respuestas (falta calificarla)
+  S.activeSession = () => S.sessions().find((s) => !s.done && Date.now() - (s.u || s.t0) < 21 * DAY) || null;
   S.newSession = function (opts) {
     const t = Date.now();
     const s = {
@@ -236,7 +291,8 @@
     emit('finish');
   };
   S.discard = function (s) {
-    delete S.state.ses[s.id];
+    // lápida: la sesión descartada no regresa desde otro dispositivo al sincronizar
+    S.state.ses[s.id] = { id: s.id, t0: s.t0, u: Date.now(), del: 1, qs: [], it: {}, fl: [] };
     touch('w-' + U.weekKey(s.t0));
     S.recompute();
     emit('discard');
@@ -260,11 +316,15 @@
   S.recompute = function () {
     const bank = (EG.data && EG.data.bank) || new Map();
     const items = [];
+    // un simulacro sin calificar todavía no cuenta en estadísticas ni repaso (sus errores no deben verse antes de
+    // terminarlo); sus respuestas sí cuentan para la actividad del día y la racha
+    const pending = [];
     for (const s of Object.values(S.state.ses)) {
-      for (const qid of Object.keys(s.it)) {
+      const open = s.mode === 'exam' && !s.done;
+      for (const qid of Object.keys(s.it || {})) {
         const it = s.it[qid];
         if (!it || it[0] == null) continue;
-        items.push({ t: it[3] || s.t0, qid, ans: it[0], ms: it[2] || 0, g: it[4] || 0, k: s.k });
+        (open ? pending : items).push({ t: it[3] || s.t0, qid, ans: it[0], ms: it[2] || 0, g: it[4] || 0, k: s.k });
       }
     }
     items.sort((a, b) => a.t - b.t);
@@ -278,6 +338,7 @@
       if (!qq) continue;
       const ok = S.grade(qq, x.ans) || 0;
       const st = q.get(x.qid) || { a: 0, c: 0, l: 0, ok: 0, b: 0, d: 0, g: 0 };
+      const due = st.d;
       st.a++;
       st.c += ok;
       st.l = x.t;
@@ -285,7 +346,8 @@
       st.g = x.g;
       if (!ok) st.b = 0;
       else if (x.g) st.b = 1;
-      else st.b = st.a === 1 ? 3 : Math.min(5, Math.max(2, st.b + 1));
+      // un acierto antes de que toque repasarla no sube de caja (tras un fallo queda en 1: vuelve al día siguiente)
+      else st.b = st.a === 1 ? 3 : x.t >= due ? Math.min(5, Math.max(2, st.b + 1)) : Math.max(1, st.b);
       st.d = x.t + INTERVAL[st.b];
       q.set(x.qid, st);
       const dk = U.dayKey(x.t);
@@ -297,6 +359,16 @@
       n++;
       c += ok;
       ms += Math.min(x.ms, 15 * 60000);
+    }
+    // p: las del día que todavía no tienen acierto o error
+    for (const x of pending) {
+      if (!bank.has(x.qid)) continue;
+      const dk = U.dayKey(x.t);
+      const day = daily.get(dk) || { n: 0, c: 0, ms: 0 };
+      day.n++;
+      day.p = (day.p || 0) + 1;
+      day.ms += Math.min(x.ms, 15 * 60000);
+      daily.set(dk, day);
     }
     let streak = 0;
     let cur = Date.now();
@@ -429,7 +501,7 @@
         return true;
     }
   }
-  // opts: {subs, topics, ids, n, filter, types, diffs, seed, keepCases}
+  // opts: {subs, topics, ids, n, filter, types, diffs, seed, keepCases, countOnly}
   S.pick = function (opts) {
     const o = Object.assign({ n: 20, filter: 'smart', keepCases: true }, opts);
     const data = EG.data;
@@ -444,13 +516,16 @@
     if (o.types && o.types.length) pool = pool.filter((id) => o.types.includes(data.bank.get(id).type));
     if (o.diffs && o.diffs.length) pool = pool.filter((id) => o.diffs.includes(data.bank.get(id).diff));
     pool = pool.filter((id) => passFilter(id, o.filter, now));
+    // solo contar las disponibles (constructor de sesiones): sin puntuar ni elegir
+    if (o.countOnly) return pool;
     const scored = pool.map((id) => ({ id, s: scoreFor(id, o.filter, rnd, now), topic: data.bank.get(id).sub + '.' + data.bank.get(id).topic }));
     scored.sort((a, b) => b.s - a.s);
     const chosen = [];
     const taken = new Set();
     const perTopic = {};
     const inPool = new Set(pool);
-    while (chosen.length < o.n && taken.size < scored.length) {
+    let count = 0;
+    while (count < o.n && taken.size < scored.length) {
       let best = null;
       let bestS = -Infinity;
       for (const x of scored) {
@@ -469,8 +544,11 @@
         if (!group.includes(best.id)) group.unshift(best.id);
       }
       for (const id of group) taken.add(id);
+      // n cuenta preguntas, no grupos: un caso que se pasaría por más de una se salta (como en pickExam)
+      if (count && count + group.length > o.n + (group.length > 1 ? 1 : 0)) continue;
       perTopic[best.topic] = (perTopic[best.topic] || 0) + group.length;
       chosen.push(group);
+      count += group.length;
     }
     // casos juntos, el resto revuelto
     return U.shuffle(chosen, rnd).flat();
@@ -541,7 +619,8 @@
     for (const sub of EG.data.meta.subs) {
       if (sub.area === 'LC') per[sub.code] = sub.code === 'LC1' ? cfg.lc[0] : cfg.lc[1];
       else per[sub.code] = cfg.per;
-      if (area && sub.area !== area) per[sub.code] = 0;
+      // "Solo un área": cfg.per por subárea del área elegida (también Lenguaje y Comunicación)
+      if (area) per[sub.code] = sub.area === area ? cfg.per : 0;
     }
     return per;
   };
@@ -573,9 +652,10 @@
     const days = [];
     const diagDone = Object.values(S.state.ses).some((s) => s.k === 'diag' && s.done);
     const simDays = new Set();
-    if (L >= 10) [Math.floor(L * 0.33), Math.floor(L * 0.62), L - 3].forEach((d) => simDays.add(d));
-    else if (L >= 5) simDays.add(L - 3);
-    const lightDay = L >= 3 ? L - 1 : -1;
+    // anclados a la fecha del examen (18, 10 y 3 días antes; ligero la víspera) para que lleguen a "hoy"
+    const hasDate = S.examDay() != null;
+    if (hasDate) for (const k of [18, 10, 3]) if (L - k >= 0) simDays.add(L - k);
+    const lightDay = hasDate && L >= 1 ? L - 1 : -1;
     const subs = EG.data.meta.subs;
     const weight = (s) => {
       const base = s.area === 'LC' ? (s.code === 'LC1' ? 0.45 : 0.55) : 1;
@@ -620,7 +700,7 @@
       const tasks = [];
       if (d === 0 && !diagDone && L >= 3) tasks.push({ type: 'diag' });
       if (simDays.has(d)) {
-        tasks.push({ type: 'exam', kind: d === L - 3 && L >= 10 ? 'completo' : 'medio' });
+        tasks.push({ type: 'exam', kind: d === L - 3 ? 'completo' : 'medio' });
         tasks.push({ type: 'review', n: Math.round(goal * 0.3) });
       } else if (d === lightDay) {
         tasks.push({ type: 'review', n: Math.round(goal * 0.5) });
@@ -647,10 +727,10 @@
     const key = U.dayKey(Date.now());
     const bySub = {};
     let review = 0;
-    let exam = false;
+    const exams = new Set();
     let diag = false;
     for (const s of Object.values(S.state.ses)) {
-      for (const qid of Object.keys(s.it)) {
+      for (const qid of Object.keys(s.it || {})) {
         const it = s.it[qid];
         if (!it || it[0] == null || U.dayKey(it[3] || s.t0) !== key) continue;
         const q = EG.data.bank.get(qid);
@@ -659,11 +739,12 @@
         else bySub[q.sub] = (bySub[q.sub] || 0) + 1;
       }
       if (s.done && U.dayKey(s.t1) === key) {
-        if (s.k === 'exam') exam = true;
+        // tipos de simulacro completos terminados hoy (un mini simulacro o "Solo un área" no cuentan para el plan)
+        if (s.k === 'exam' && s.src && S.EXAMS[s.src.exam] && !s.src.area) exams.add(s.src.exam);
         if (s.k === 'diag') diag = true;
       }
     }
-    return { bySub, review, exam, diag };
+    return { bySub, review, exam: exams.size > 0, exams, diag };
   };
 
   // ---------- exportar / importar / reiniciar ----------
@@ -671,45 +752,74 @@
   S.importData = function (text) {
     const obj = JSON.parse(text);
     if (!obj || obj.app !== 'egel-sobresaliente' || obj.v !== 1) throw new Error('El archivo no es un respaldo de esta app.');
-    mergeMain(obj.main, true);
-    mergeMarks(obj.marks);
+    // lo del archivo anterior al último "Borrar todo" se restaura con la fecha del borrado; lo inválido se descarta
+    const after = S.state.main.resetAt || 0;
+    if (after) liftBefore(obj, after);
+    // perfil y ajustes del archivo si son más recientes, o si los locales solo vienen de la bienvenida
+    const fresh = S.state.main.u === S.state.main.welcomeAt && isObj(obj.main) && isObj(obj.main.profile) && !!obj.main.profile.onboarded;
+    if (mergeMain(obj.main, fresh)) touch('main');
+    if (mergeMarks(obj.marks)) touch('marks');
     const weeks = new Set();
-    for (const s of Object.values(obj.ses || {})) {
-      if (mergeSession(s)) weeks.add(U.weekKey(s.t0));
+    for (const s of Object.values(isObj(obj.ses) ? obj.ses : {})) {
+      if (isObj(s) && mergeSession(s)) weeks.add(U.weekKey(s.t0));
     }
     weeks.forEach((w) => touch('w-' + w));
-    touch('marks');
     S.state.plan = null;
     S.recompute();
     emit('import');
   };
+  // Respaldo anterior a "Borrar todo": se trata como restaurado en el momento del borrado, para que lo hecho después
+  // gane al fusionar y la sincronización (que descarta lo anterior a resetAt) no lo vuelva a borrar. t0 no cambia.
+  function liftBefore(obj, t) {
+    const rd = isObj(obj.main) && isObj(obj.main.read) ? obj.main.read : {};
+    for (const [k, v] of Object.entries(rd)) if (typeof v === 'number' && Math.abs(v) < t) {
+      if (v > 0) rd[k] = t;
+      else delete rd[k];
+    }
+    const q = isObj(obj.marks) && isObj(obj.marks.q) ? obj.marks.q : {};
+    for (const m of Object.values(q)) if (isObj(m) && (m.t || 0) < t) m.t = t;
+    const ses = isObj(obj.ses) ? obj.ses : {};
+    for (const [id, s] of Object.entries(ses)) if (isObj(s) && Math.max(s.t0 || 0, s.u || 0) < t) {
+      if (s.del) delete ses[id];
+      else s.u = t;
+    }
+  }
+  // Devuelve false si la copia de la nube no se pudo borrar todavía (queda pendiente y se reintenta).
   S.reset = async function () {
     const keys = docKeys();
-    S.state = defaults();
+    const now = Date.now();
+    const keep = { owner: S.state.owner, syncedOnce: S.state.syncedOnce };
+    S.state = Object.assign(defaults(), keep);
+    // lápida en main: los demás dispositivos descartan lo anterior a resetAt al sincronizar
+    S.state.main.u = now;
+    S.state.main.resetAt = now;
     U.storage.set(KEY, S.state);
     S.recompute();
-    if (SYNC.on) {
-      for (const k of keys) {
-        try {
-          await col().doc(k).delete();
-        } catch (e) {
-          /* se reintenta en la próxima sincronización */
-        }
-      }
+    let ok = true;
+    if (SYNC.on && !SYNC.readonly) {
+      keys.forEach((k) => SYNC.dirty.add(k));
+      SYNC.dirty.add('main');
+      while (SYNC.writing) await new Promise((r) => setTimeout(r, 200));
+      await flush();
+      ok = !SYNC.dirty.size;
     }
     emit('reset');
+    return ok;
   };
 
   // ---------- sincronización con claude.ai (db por usuario) ----------
-  const SYNC = { on: false, db: null, uid: null, dirty: new Set(), writing: false, readonly: false, lastPull: 0 };
+  // pulled: ya hubo un pull exitoso en esta carga; antes no se sube nada (set() reemplaza documentos completos)
+  const SYNC = { on: false, db: null, uid: null, dirty: new Set(), writing: false, readonly: false, lastPull: 0, pulled: false, pulling: null, retry: 0, retryT: null };
   const col = () => SYNC.db.collection('data/users/' + SYNC.uid);
+  // copia propia de lo que entrega la db: sus objetos llegan congelados y la app los modifica
+  const own = (x) => JSON.parse(JSON.stringify(x == null ? null : x));
   function docKeys() {
     const keys = new Set(['main', 'marks']);
     for (const s of Object.values(S.state.ses)) keys.add('w-' + U.weekKey(s.t0));
     return [...keys];
   }
   function buildDoc(key) {
-    if (key === 'main') return { u: S.state.main.u, profile: S.state.main.profile, settings: S.state.main.settings, read: S.state.main.read };
+    if (key === 'main') return { u: S.state.main.u, resetAt: S.state.main.resetAt || 0, profile: S.state.main.profile, settings: S.state.main.settings, read: S.state.main.read };
     if (key === 'marks') return { u: S.state.marks.u, q: S.state.marks.q };
     const wk = key.slice(2);
     const s = {};
@@ -720,78 +830,172 @@
     }
     return { u, s };
   }
-  function mergeMain(remote, force) {
-    if (!remote) return false;
-    if (force || (remote.u || 0) > (S.state.main.u || 0)) {
-      const local = S.state.main;
-      S.state.main = {
-        u: Math.max(remote.u || 0, local.u || 0),
-        profile: Object.assign({}, local.profile, remote.profile || {}),
-        settings: Object.assign({}, local.settings, remote.settings || {}),
-        read: Object.assign({}, local.read, remote.read || {}),
-      };
-      S.state.plan = null;
-      return true;
+  // "Leído" por tema: t > 0 leído, t < 0 desmarcado (lápida); gana el de |t| mayor.
+  function mergeRead(local, remote) {
+    if (!isObj(remote)) return false;
+    const after = S.state.main.resetAt || 0;
+    let changed = false;
+    for (const [k, t] of Object.entries(remote)) {
+      if (typeof t !== 'number' || Math.abs(t) < after || Math.abs(t) <= Math.abs(local[k] || 0)) continue;
+      local[k] = t;
+      changed = true;
     }
-    return false;
+    return changed;
+  }
+  function mergeMain(remote, force) {
+    if (!isObj(remote)) return false;
+    const main = S.state.main;
+    let changed = mergeRead(main.read, remote.read);
+    if (force || (Number(remote.u) || 0) > (main.u || 0)) {
+      main.profile = cleanProfile(Object.assign({}, main.profile, isObj(remote.profile) ? remote.profile : {}));
+      main.settings = cleanSettings(Object.assign({}, main.settings, isObj(remote.settings) ? remote.settings : {}));
+      main.u = Math.max(Number(remote.u) || 0, main.u || 0);
+      changed = true;
+    }
+    if (changed) S.state.plan = null;
+    return changed;
   }
   function mergeMarks(remote) {
-    if (!remote || !remote.q) return false;
+    if (!isObj(remote) || !isObj(remote.q)) return false;
+    const after = S.state.main.resetAt || 0;
     let changed = false;
     for (const [id, m] of Object.entries(remote.q)) {
+      if (!validMark(m) || (m.t || 0) < after) continue;
       const l = S.state.marks.q[id];
       if (!l || (m.t || 0) > (l.t || 0)) {
         S.state.marks.q[id] = m;
         changed = true;
       }
     }
-    S.state.marks.u = Math.max(S.state.marks.u || 0, remote.u || 0);
+    S.state.marks.u = Math.max(S.state.marks.u || 0, Number(remote.u) || 0);
     return changed;
   }
+  // Fusiona una sesión remota dentro del objeto local, que la vista abierta sigue usando: por pregunta gana
+  // la respuesta más reciente; terminada y tiempo se acumulan; marcas y posición son de la copia más nueva.
   function mergeSession(r) {
-    if (!r || !r.id || !Array.isArray(r.qs)) return false;
+    if (!cleanSession(r)) return false;
     const l = S.state.ses[r.id];
-    if (!l || (r.u || 0) > (l.u || 0)) {
+    if (!l) {
       S.state.ses[r.id] = r;
       return true;
     }
-    return false;
+    const newer = (r.u || 0) > (l.u || 0);
+    if (l.del || r.del) {
+      // lápida contra sesión: gana la copia más reciente completa
+      if (!newer) return false;
+      for (const k of Object.keys(l)) delete l[k];
+      Object.assign(l, r);
+      return true;
+    }
+    let changed = false;
+    for (const [qid, x] of Object.entries(r.it)) {
+      const y = l.it[qid];
+      const tx = x[3] || 0;
+      const ty = (y && y[3]) || 0;
+      if (!y || tx > ty || (tx === ty && newer && JSON.stringify(x) !== JSON.stringify(y))) {
+        l.it[qid] = x;
+        changed = true;
+      }
+    }
+    if (r.done && !l.done) {
+      l.done = true;
+      changed = true;
+    }
+    const t1 = Math.max(l.t1 || 0, r.t1 || 0) || null;
+    if (t1 !== (l.t1 || null)) {
+      l.t1 = t1;
+      changed = true;
+    }
+    if ((r.el || 0) > (l.el || 0)) {
+      l.el = r.el;
+      changed = true;
+    }
+    if (newer) {
+      if (l.pos !== r.pos || JSON.stringify(l.fl) !== JSON.stringify(r.fl)) changed = true;
+      l.fl = r.fl;
+      l.pos = r.pos;
+      l.u = r.u;
+    }
+    return changed;
   }
-  async function pull() {
-    if (!SYNC.on) return;
+  // ¿La copia local tiene algo que la remota no? (respuesta más nueva, cierre, lápida…)
+  function ahead(l, r) {
+    if (!isObj(r)) return true;
+    if ((l.u || 0) > (r.u || 0)) return true;
+    if (l.del || r.del) return false;
+    if (l.done && !r.done) return true;
+    const rit = isObj(r.it) ? r.it : {};
+    return Object.entries(l.it || {}).some(([qid, y]) => !Array.isArray(rit[qid]) || (y[3] || 0) > (rit[qid][3] || 0));
+  }
+  // "Borrar todo" hecho en otro dispositivo: descartar lo anterior a t sin volver a subirlo
+  function dropBefore(t) {
+    for (const s of Object.values(S.state.ses)) if (Math.max(s.t0 || 0, s.u || 0) < t) delete S.state.ses[s.id];
+    for (const [id, m] of Object.entries(S.state.marks.q)) if ((m.t || 0) < t) delete S.state.marks.q[id];
+    for (const [k, v] of Object.entries(S.state.main.read)) if (Math.abs(v) < t) delete S.state.main.read[k];
+    S.state.main.resetAt = t;
+    S.state.plan = null;
+  }
+  function pull() {
+    if (!SYNC.on) return Promise.resolve();
+    if (!SYNC.pulling) SYNC.pulling = doPull().finally(() => (SYNC.pulling = null));
+    return SYNC.pulling;
+  }
+  async function doPull() {
     SYNC.lastPull = Date.now();
     S.sync.status = 'syncing';
     emit('sync');
     try {
       const snap = await col().get();
-      const remoteKeys = new Set();
+      const docs = snap.docs.map((d) => ({ id: d.id, body: own(d.data()) })).filter((d) => isObj(d.body));
+      const remoteKeys = new Set(docs.map((d) => d.id));
       let changed = false;
-      for (const d of snap.docs) {
-        const body = d.data();
-        if (!body) continue;
-        remoteKeys.add(d.id);
-        if (d.id === 'main') {
-          if (mergeMain(body)) changed = true;
-          else if ((S.state.main.u || 0) > (body.u || 0)) SYNC.dirty.add('main');
-        } else if (d.id === 'marks') {
+      // un "Borrar todo" más nuevo hecho en otro dispositivo se aplica antes de fusionar lo demás
+      const rm = docs.find((d) => d.id === 'main');
+      const rAt = rm ? Number(rm.body.resetAt) || 0 : 0;
+      if (rAt > (S.state.main.resetAt || 0)) {
+        dropBefore(rAt);
+        changed = true;
+      }
+      const after = S.state.main.resetAt || 0;
+      for (const { id, body } of docs) {
+        if (id === 'main') {
+          // primera sincronización del dispositivo: el perfil ya configurado en la nube gana al de la bienvenida
+          const first = !S.state.syncedOnce && isObj(body.profile) && !!body.profile.onboarded && (Number(body.u) || 0) > after;
+          if (mergeMain(body, first)) changed = true;
+          if (first) {
+            S.state.main.u = Number(body.u) || 0;
+            SYNC.dirty.delete('main');
+          } else if ((S.state.main.u || 0) > (Number(body.u) || 0) || after > rAt) SYNC.dirty.add('main');
+        } else if (id === 'marks') {
           if (mergeMarks(body)) changed = true;
-          const localNewer = Object.entries(S.state.marks.q).some(([id, m]) => !body.q || !body.q[id] || (m.t || 0) > (body.q[id].t || 0));
+          const rq = isObj(body.q) ? body.q : {};
+          const localNewer = Object.entries(S.state.marks.q).some(([qid, m]) => !isObj(rq[qid]) || (m.t || 0) > (rq[qid].t || 0)) || Object.values(rq).some((m) => !isObj(m) || (m.t || 0) < after);
           if (localNewer) SYNC.dirty.add('marks');
-        } else if (d.id.startsWith('w-')) {
-          const rs = body.s || {};
-          for (const s of Object.values(rs)) if (mergeSession(s)) changed = true;
-          const wk = d.id.slice(2);
-          const localNewer = Object.values(S.state.ses).some((s) => U.weekKey(s.t0) === wk && (!rs[s.id] || (s.u || 0) > (rs[s.id].u || 0)));
-          if (localNewer) SYNC.dirty.add(d.id);
+        } else if (id.startsWith('w-')) {
+          const rs = isObj(body.s) ? body.s : {};
+          let stale = false;
+          for (const s of Object.values(rs)) {
+            // borrada por un "Borrar todo": no regresa y el documento se reescribe sin ella
+            if (!isObj(s) || Math.max(s.t0 || 0, s.u || 0) < after) stale = true;
+            else if (mergeSession(s)) changed = true;
+          }
+          const wk = id.slice(2);
+          if (stale || Object.values(S.state.ses).some((s) => U.weekKey(s.t0) === wk && ahead(s, rs[s.id]))) SYNC.dirty.add(id);
         }
       }
       for (const k of docKeys()) if (!remoteKeys.has(k)) {
         const b = buildDoc(k);
         if (k === 'main' ? b.u || S.state.main.profile.onboarded : k === 'marks' ? Object.keys(b.q).length : Object.keys(b.s).length) SYNC.dirty.add(k);
       }
+      SYNC.pulled = true;
+      SYNC.retry = 0;
+      if (!S.state.syncedOnce) {
+        S.state.syncedOnce = true;
+        saveLocal();
+      }
       S.sync.status = 'ok';
       S.sync.last = Date.now();
-      S.sync.error = '';
+      if (S.sync.error !== 'quota') S.sync.error = '';
       if (changed) {
         U.storage.set(KEY, S.state);
         S.recompute();
@@ -803,14 +1007,21 @@
       S.sync.status = 'error';
       S.sync.error = (e && e.code) || 'error';
       emit('sync');
+      // sin un primer pull exitoso no se sube nada: reintentar con espera creciente
+      if (!SYNC.pulled) {
+        SYNC.retry = Math.min(60000, (SYNC.retry || 2000) * 2);
+        clearTimeout(SYNC.retryT);
+        SYNC.retryT = setTimeout(() => pull(), SYNC.retry);
+      }
     }
   }
   const scheduleFlush = U.debounce(() => flush(), 2500);
   async function flush() {
-    if (!SYNC.on || SYNC.readonly || SYNC.writing || !SYNC.dirty.size) return;
+    if (!SYNC.on || !SYNC.pulled || SYNC.readonly || SYNC.writing || !SYNC.dirty.size) return;
     SYNC.writing = true;
     S.sync.status = 'syncing';
     emit('sync');
+    let quota = false;
     try {
       while (SYNC.dirty.size) {
         const key = SYNC.dirty.values().next().value;
@@ -828,15 +1039,21 @@
             break;
           }
           if (code === 'quota_exceeded') {
+            // la nube está llena (no es transitorio): la clave queda pendiente y las vistas lo avisan
+            SYNC.dirty.add(key);
             S.sync.error = 'quota';
+            quota = true;
             break;
           }
           SYNC.dirty.add(key);
           throw e;
         }
       }
-      S.sync.status = SYNC.readonly ? 'idle' : 'ok';
-      S.sync.last = Date.now();
+      S.sync.status = SYNC.readonly ? 'idle' : quota ? 'error' : 'ok';
+      if (!quota) {
+        if (S.sync.error === 'quota') S.sync.error = '';
+        S.sync.last = Date.now();
+      }
     } catch (e) {
       S.sync.status = 'error';
       S.sync.error = (e && e.code) || 'error';
@@ -870,19 +1087,28 @@
       uid = null;
     }
     if (!uid) return false;
+    // el progreso guardado en el navegador es de una cuenta: otra cuenta usa su propia clave (sin mezclar ni subir lo ajeno)
+    if (S.state.owner && S.state.owner !== uid) {
+      saveLocal.flush();
+      KEY = BASE_KEY + ':' + uid;
+      S.state = sanitize(U.storage.get(KEY, null));
+      S.recompute();
+      emit('remote');
+    }
+    if (S.state.owner !== uid) {
+      S.state.owner = uid;
+      saveLocal();
+    }
     SYNC.db = db;
     SYNC.uid = uid;
     SYNC.on = true;
     S.sync.mode = 'cloud';
     await pull();
+    // al ocultar o cerrar, S.load ya registró el guardado (S.flushSync)
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        if (Date.now() - SYNC.lastPull > 45000) pull();
-      } else {
-        S.flushSync();
-      }
+      if (document.visibilityState === 'visible' && Date.now() - SYNC.lastPull > 45000) pull();
     });
-    window.addEventListener('pagehide', () => S.flushSync());
+    window.addEventListener('online', () => pull());
     return true;
   };
   S.pullNow = () => pull();

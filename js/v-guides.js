@@ -72,6 +72,8 @@
           return `<li><a href="#g-${esc(sec.id)}" data-act="guide-jump" data-id="${esc(sec.id)}" class="${read ? 'read' : ''}">${read ? ui.icon('check') : `<span class="code">${esc(sec.id.slice(1))}</span>`}<span>${esc(sec.title)}</span></a></li>`;
         })
         .join('');
+      // índice abierto en escritorio y cerrado en teléfono, salvo que el estudiante lo haya cambiado (p.toc)
+      const tocOpen = p.toc != null ? p.toc : !window.matchMedia('(max-width: 899px)').matches;
       const body = g.sections
         .map((sec) => {
           const key = s.code + '.' + sec.id;
@@ -83,7 +85,7 @@
         .join('');
       return `<div class="page guide">${head}
         <div class="guide-grid">
-          <nav class="guide-toc" aria-label="Temas de la guía"><details open><summary>Temas</summary><ol>${toc}</ol></details></nav>
+          <nav class="guide-toc" aria-label="Temas de la guía"><details${tocOpen ? ' open' : ''}><summary>Temas</summary><ol>${toc}</ol></details></nav>
           <article class="guide-body">${g.intro ? `<div class="rich g-intro">${EG.md.render(g.intro)}</div>` : ''}${body}</article>
         </div></div>`;
     },
@@ -100,14 +102,14 @@
           .catch(() => ui.toast('No se pudo cargar la guía. Revisa tu conexión.'));
         return;
       }
-      if (p.topic) {
+      // saltar al tema solo en la primera montura: "Marcar como leído" y la sincronización vuelven a dibujar la guía
+      if (p.topic && !p.jumped) {
+        p.jumped = true;
         const target = U.$('#g-' + p.topic, el);
         if (target) setTimeout(() => target.scrollIntoView({ block: 'start' }), 30);
       }
-      if (window.matchMedia('(max-width: 899px)').matches) {
-        const d = U.$('.guide-toc details', el);
-        if (d) d.open = false;
-      }
+      const d = U.$('.guide-toc details', el);
+      if (d) d.addEventListener('toggle', () => (p.toc = d.open));
     },
   };
   A['guide-jump'] = (el) => {
