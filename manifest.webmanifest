@@ -1,0 +1,35 @@
+{
+ "name": "Sobresaliente · EGEL Plus COMPU",
+ "short_name": "Sobresaliente",
+ "description": "Preparación para el EGEL Plus COMPU: preguntas tipo Ceneval con retroalimentación, guías, repaso espaciado y simulacros.",
+ "lang": "es-MX",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "orientation": "any",
+ "background_color": "#0a1524",
+ "theme_color": "#1d5bc0",
+ "icons": [
+  {
+   "src": "icons/icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png"
+  },
+  {
+   "src": "icons/icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png"
+  },
+  {
+   "src": "icons/icon-maskable-512.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "maskable"
+  },
+  {
+   "src": "icons/icon.svg",
+   "sizes": "any",
+   "type": "image/svg+xml"
+  }
+ ]
+}

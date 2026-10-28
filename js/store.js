@@ -1,0 +1,889 @@
+/* Estado persistente, sincronización (claude.ai db o local), estadísticas derivadas, repaso espaciado,
+   selección de preguntas, estimación del Índice Ceneval y plan de estudio. */
+(function () {
+  'use strict';
+  const EG = window.EG;
+  const U = EG.U;
+  const KEY = 'egel-sobresaliente:v1';
+  const HOUR = 3600000;
+  const DAY = 86400000;
+  // Intervalos de repaso por caja (Leitner): 0 = fallada, 1 = adivinada, 2..5 = dominio creciente.
+  const INTERVAL = [20 * HOUR, DAY, 3 * DAY, 7 * DAY, 16 * DAY, 35 * DAY];
+
+  const S = (EG.store = {
+    state: null,
+    derived: null,
+    sync: { mode: 'local', status: 'idle', error: '', last: 0 },
+    INTERVAL,
+  });
+  const listeners = new Set();
+  S.on = (fn) => listeners.add(fn);
+  S.off = (fn) => listeners.delete(fn);
+  const emit = (why) => listeners.forEach((fn) => {
+    try {
+      fn(why);
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
+  function defaults() {
+    return {
+      v: 1,
+      main: {
+        u: 0,
+        profile: { name: '', examDate: '', dailyGoal: 40, weak: [], onboarded: false, created: Date.now() },
+        settings: { theme: 'system', text: 1, shuffle: true, oneTap: false, practiceTimer: false },
+        read: {},
+      },
+      marks: { u: 0, q: {} },
+      ses: {},
+      plan: null,
+    };
+  }
+
+  // ---------- carga y guardado local ----------
+  function sanitize(st) {
+    const d = defaults();
+    if (!st || typeof st !== 'object' || st.v !== 1) return d;
+    st.main = Object.assign(d.main, st.main || {});
+    st.main.profile = Object.assign(d.main.profile, st.main.profile || {});
+    st.main.settings = Object.assign(d.main.settings, st.main.settings || {});
+    st.main.read = st.main.read || {};
+    st.marks = Object.assign(d.marks, st.marks || {});
+    st.marks.q = st.marks.q || {};
+    st.ses = st.ses || {};
+    return st;
+  }
+  S.load = function () {
+    S.state = sanitize(U.storage.get(KEY, null));
+    S.recompute();
+  };
+  const saveLocal = U.debounce(() => U.storage.set(KEY, S.state), 300);
+  S.saveNow = () => saveLocal.flush();
+
+  // Marca un documento como modificado: guarda local y agenda la sincronización.
+  function touch(docKey) {
+    const t = Date.now();
+    if (docKey === 'main') S.state.main.u = t;
+    else if (docKey === 'marks') S.state.marks.u = t;
+    saveLocal();
+    if (SYNC.on) {
+      SYNC.dirty.add(docKey);
+      scheduleFlush();
+    }
+  }
+  S.touch = touch;
+
+  // ---------- perfil y ajustes ----------
+  S.profile = () => S.state.main.profile;
+  S.settings = () => S.state.main.settings;
+  S.setProfile = (patch) => {
+    Object.assign(S.state.main.profile, patch);
+    S.state.plan = null;
+    touch('main');
+    emit('profile');
+  };
+  S.setSettings = (patch) => {
+    Object.assign(S.state.main.settings, patch);
+    touch('main');
+    emit('settings');
+  };
+  S.markRead = (key, on) => {
+    if (on) S.state.main.read[key] = Date.now();
+    else delete S.state.main.read[key];
+    touch('main');
+    emit('read');
+  };
+  S.isRead = (key) => !!S.state.main.read[key];
+
+  // ---------- marcas por pregunta (guardada, reporte) ----------
+  S.mark = (qid) => S.state.marks.q[qid] || null;
+  S.toggleBookmark = (qid) => {
+    const m = Object.assign({ m: 0, r: null }, S.state.marks.q[qid]);
+    m.m = m.m ? 0 : 1;
+    m.t = Date.now();
+    S.state.marks.q[qid] = m;
+    touch('marks');
+    emit('marks');
+    return !!m.m;
+  };
+  S.report = (qid, reason, text) => {
+    const m = Object.assign({ m: 0, r: null }, S.state.marks.q[qid]);
+    m.r = reason ? { reason, text: text || '', t: Date.now() } : null;
+    m.t = Date.now();
+    S.state.marks.q[qid] = m;
+    touch('marks');
+    emit('marks');
+    if (reason && SYNC.on) {
+      SYNC.db
+        .collection('reports')
+        .add({ qid, reason, text: String(text || '').slice(0, 800), t: Date.now(), v: (EG.data.meta && EG.data.meta.version) || '' })
+        .catch(() => {});
+    }
+  };
+  S.bookmarked = () => Object.keys(S.state.marks.q).filter((id) => S.state.marks.q[id].m);
+  S.reported = () => Object.keys(S.state.marks.q).filter((id) => S.state.marks.q[id].r);
+
+  // ---------- calificación ----------
+  function cleanNum(s) {
+    let t = String(s).trim().toLowerCase().replace(/\s+/g, '');
+    if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');
+    else if (/^-?\d+,\d+$/.test(t)) t = t.replace(',', '.');
+    return t;
+  }
+  S.grade = function (q, ans) {
+    if (!q || ans == null || ans === '') return null;
+    switch (q.type) {
+      case 'mc':
+        return ans === q.answer ? 1 : 0;
+      case 'multi': {
+        if (!Array.isArray(ans) || ans.length !== 2) return 0;
+        const a = ans.slice().sort((x, y) => x - y);
+        return a[0] === q.answer[0] && a[1] === q.answer[1] ? 1 : 0;
+      }
+      case 'order':
+        return Array.isArray(ans) && ans.length === q.answer.length && ans.every((v, i) => v === q.answer[i]) ? 1 : 0;
+      case 'numeric': {
+        const g = cleanNum(ans);
+        const cands = [q.answer].concat(q.accept || []);
+        if (cands.some((c) => cleanNum(c) === g)) return 1;
+        const gn = Number(g);
+        if (g !== '' && !Number.isNaN(gn)) {
+          const tol = q.tol != null ? q.tol : 1e-9;
+          return cands.some((c) => {
+            const cn = Number(cleanNum(c));
+            return !Number.isNaN(cn) && Math.abs(cn - gn) <= tol + 1e-12;
+          })
+            ? 1
+            : 0;
+        }
+        return 0;
+      }
+      default:
+        return 0;
+    }
+  };
+
+  // ---------- sesiones ----------
+  S.sessions = () => Object.values(S.state.ses).sort((a, b) => b.t0 - a.t0);
+  S.session = (id) => S.state.ses[id] || null;
+  S.activeSession = () => S.sessions().find((s) => !s.done && s.qs.some((id) => !(s.it[id] && s.it[id][0] != null)) && Date.now() - (s.u || s.t0) < 21 * DAY) || null;
+  S.newSession = function (opts) {
+    const t = Date.now();
+    const s = {
+      id: U.uid('s'),
+      k: opts.kind || 'practice',
+      title: opts.title || 'Práctica',
+      mode: opts.mode || 'tutor',
+      t0: t,
+      u: t,
+      t1: null,
+      qs: opts.qs.slice(),
+      sh: U.hash(t + ':' + Math.random()),
+      pos: 0,
+      it: {},
+      fl: [],
+      lim: opts.limit || 0,
+      el: 0,
+      done: false,
+      src: opts.src || null,
+    };
+    // cerrar otras sesiones abiertas del mismo tipo de práctica para no acumular pendientes
+    S.state.ses[s.id] = s;
+    touchSession(s);
+    emit('session');
+    return s;
+  };
+  function touchSession(s) {
+    s.u = Date.now();
+    touch('w-' + U.weekKey(s.t0));
+  }
+  S.touchSession = touchSession;
+  S.answer = function (s, qid, ans, ms, extra) {
+    const prev = s.it[qid];
+    const g = extra && extra.g ? 1 : 0;
+    s.it[qid] = [ans, S.grade(EG.data.bank.get(qid), ans), Math.round((prev && prev[2]) || 0) + Math.round(ms || 0), Date.now(), g];
+    touchSession(s);
+    if (s.mode === 'tutor') S.recompute();
+    emit('answer');
+  };
+  S.setGuess = function (s, qid, on) {
+    const it = s.it[qid];
+    if (!it) return;
+    it[4] = on ? 1 : 0;
+    touchSession(s);
+    S.recompute();
+    emit('answer');
+  };
+  S.toggleFlag = function (s, qid) {
+    const i = s.fl.indexOf(qid);
+    if (i >= 0) s.fl.splice(i, 1);
+    else s.fl.push(qid);
+    touchSession(s);
+    emit('flag');
+  };
+  S.setPos = function (s, pos) {
+    s.pos = pos;
+    touchSession(s);
+  };
+  S.finish = function (s) {
+    if (s.done) return;
+    s.done = true;
+    s.t1 = Date.now();
+    touchSession(s);
+    S.recompute();
+    emit('finish');
+  };
+  S.discard = function (s) {
+    delete S.state.ses[s.id];
+    touch('w-' + U.weekKey(s.t0));
+    S.recompute();
+    emit('discard');
+  };
+  S.sessionScore = function (s) {
+    let n = 0;
+    let c = 0;
+    let ms = 0;
+    for (const id of s.qs) {
+      const it = s.it[id];
+      if (it && it[0] != null) {
+        n++;
+        c += S.grade(EG.data.bank.get(id), it[0]) || 0;
+        ms += it[2] || 0;
+      }
+    }
+    return { n, c, total: s.qs.length, ms };
+  };
+
+  // ---------- estadísticas derivadas ----------
+  S.recompute = function () {
+    const bank = (EG.data && EG.data.bank) || new Map();
+    const items = [];
+    for (const s of Object.values(S.state.ses)) {
+      for (const qid of Object.keys(s.it)) {
+        const it = s.it[qid];
+        if (!it || it[0] == null) continue;
+        items.push({ t: it[3] || s.t0, qid, ans: it[0], ms: it[2] || 0, g: it[4] || 0, k: s.k });
+      }
+    }
+    items.sort((a, b) => a.t - b.t);
+    const q = new Map();
+    const daily = new Map();
+    let n = 0;
+    let c = 0;
+    let ms = 0;
+    for (const x of items) {
+      const qq = bank.get(x.qid);
+      if (!qq) continue;
+      const ok = S.grade(qq, x.ans) || 0;
+      const st = q.get(x.qid) || { a: 0, c: 0, l: 0, ok: 0, b: 0, d: 0, g: 0 };
+      st.a++;
+      st.c += ok;
+      st.l = x.t;
+      st.ok = ok;
+      st.g = x.g;
+      if (!ok) st.b = 0;
+      else if (x.g) st.b = 1;
+      else st.b = st.a === 1 ? 3 : Math.min(5, Math.max(2, st.b + 1));
+      st.d = x.t + INTERVAL[st.b];
+      q.set(x.qid, st);
+      const dk = U.dayKey(x.t);
+      const day = daily.get(dk) || { n: 0, c: 0, ms: 0 };
+      day.n++;
+      day.c += ok;
+      day.ms += Math.min(x.ms, 15 * 60000);
+      daily.set(dk, day);
+      n++;
+      c += ok;
+      ms += Math.min(x.ms, 15 * 60000);
+    }
+    let streak = 0;
+    let cur = Date.now();
+    if (!daily.has(U.dayKey(cur))) cur = U.addDays(cur, -1);
+    while (daily.has(U.dayKey(cur))) {
+      streak++;
+      cur = U.addDays(cur, -1);
+    }
+    S.derived = { q, daily, streak, totals: { n, c, ms } };
+  };
+  S.qstat = (qid) => (S.derived && S.derived.q.get(qid)) || null;
+
+  // Dominio de un conjunto de preguntas: proporción de preguntas vistas cuya última respuesta fue correcta,
+  // suavizada hacia 50% cuando hay pocos datos.
+  S.groupStats = function (qids) {
+    let seen = 0;
+    let known = 0;
+    let att = 0;
+    let cor = 0;
+    let due = 0;
+    const now = Date.now();
+    for (const id of qids) {
+      const st = S.derived.q.get(id);
+      if (!st) continue;
+      seen++;
+      known += st.ok;
+      att += st.a;
+      cor += st.c;
+      if (st.d <= now) due++;
+    }
+    const total = qids.length;
+    return {
+      total,
+      seen,
+      known,
+      att,
+      cor,
+      due,
+      coverage: total ? seen / total : 0,
+      acc: seen ? known / seen : null,
+      est: (known + 2) / (seen + 4),
+    };
+  };
+  S.subStats = (code) => S.groupStats(EG.data.bySub.get(code) || []);
+  S.topicStats = (code, tid) => S.groupStats(EG.data.byTopic.get(code + '.' + tid) || []);
+  S.areaStats = (aid) => S.groupStats(EG.data.meta.subs.filter((s) => s.area === aid).flatMap((s) => EG.data.bySub.get(s.code) || []));
+  S.dueList = function () {
+    const now = Date.now();
+    const out = [];
+    for (const [id, st] of S.derived.q) if (st.d <= now && EG.data.bank.has(id)) out.push(id);
+    out.sort((a, b) => S.derived.q.get(a).b - S.derived.q.get(b).b || S.derived.q.get(a).d - S.derived.q.get(b).d);
+    return out;
+  };
+  S.wrongList = () => [...S.derived.q].filter(([id, st]) => !st.ok && EG.data.bank.has(id)).map(([id]) => id);
+  S.guessedList = () => [...S.derived.q].filter(([id, st]) => st.ok && st.g && EG.data.bank.has(id)).map(([id]) => id);
+
+  // ---------- Índice Ceneval estimado ----------
+  // Los puntos de corte reales los fija el Ceneval; aquí se usa una meta conservadora:
+  // 60% de aciertos ≈ 1000 (Satisfactorio) y 80% ≈ 1150 (Sobresaliente).
+  const CUTS = [[0, 700], [0.6, 1000], [0.8, 1150], [1, 1300]];
+  S.icne = function (p) {
+    const x = U.clamp(p, 0, 1);
+    for (let i = 1; i < CUTS.length; i++) {
+      const [x0, y0] = CUTS[i - 1];
+      const [x1, y1] = CUTS[i];
+      if (x <= x1) return Math.round(y0 + ((x - x0) / (x1 - x0)) * (y1 - y0));
+    }
+    return 1300;
+  };
+  S.level = (idx) => (idx >= 1150 ? 'SS' : idx >= 1000 ? 'S' : 'ANS');
+  S.LEVEL_NAME = { SS: 'Sobresaliente', S: 'Satisfactorio', ANS: 'Aún no satisfactorio' };
+  S.globalLevel = function (disc, lc) {
+    if (disc === 'ANS') return 'ANS';
+    if (disc === 'SS') return lc === 'ANS' ? 'S' : 'SS';
+    return 'S';
+  };
+  // Combina proporciones por área en índices por área, por sección y nivel global.
+  S.scoreReport = function (byArea) {
+    const meta = EG.data.meta;
+    const areas = {};
+    for (const a of meta.areas) {
+      const v = byArea[a.id];
+      if (v == null) continue;
+      const idx = S.icne(v);
+      areas[a.id] = { p: v, idx, lvl: S.level(idx) };
+    }
+    const sec = (ids) => {
+      const present = ids.filter((id) => areas[id]);
+      if (!present.length) return null;
+      const w = present.reduce((s, id) => s + meta.areas.find((a) => a.id === id).items, 0);
+      const idx = Math.round(present.reduce((s, id) => s + areas[id].idx * meta.areas.find((a) => a.id === id).items, 0) / w);
+      return { idx, lvl: S.level(idx), complete: present.length === ids.length };
+    };
+    const disc = sec(['A1', 'A2', 'A3', 'A4']);
+    const lc = areas.LC ? { idx: areas.LC.idx, lvl: areas.LC.lvl, complete: true } : null;
+    const global = disc ? S.globalLevel(disc.lvl, lc ? lc.lvl : 'S') : null;
+    return { areas, disc, lc, global, lcMissing: !lc };
+  };
+  S.readiness = function () {
+    const byArea = {};
+    for (const a of EG.data.meta.areas) byArea[a.id] = S.areaStats(a.id).est;
+    return S.scoreReport(byArea);
+  };
+
+  // ---------- selección de preguntas ----------
+  function scoreFor(id, filter, rnd, now) {
+    const st = S.derived.q.get(id);
+    const j = rnd() * 1.5;
+    if (filter === 'all') return rnd();
+    if (!st) return 5 + j;
+    if (!st.ok) return 6 + (st.d <= now ? 1 : 0) + j;
+    if (st.g) return 4.5 + j;
+    if (st.d <= now) return 4 + j;
+    return 1 + Math.min(2, (now - st.l) / (7 * DAY)) + j * 0.6;
+  }
+  function passFilter(id, filter, now) {
+    const st = S.derived.q.get(id);
+    switch (filter) {
+      case 'new':
+        return !st;
+      case 'wrong':
+        return !!st && !st.ok;
+      case 'due':
+        return !!st && st.d <= now;
+      case 'guessed':
+        return !!st && st.ok && st.g;
+      case 'marked':
+        return !!(S.state.marks.q[id] && S.state.marks.q[id].m);
+      default:
+        return true;
+    }
+  }
+  // opts: {subs, topics, ids, n, filter, types, diffs, seed, keepCases}
+  S.pick = function (opts) {
+    const o = Object.assign({ n: 20, filter: 'smart', keepCases: true }, opts);
+    const data = EG.data;
+    const now = Date.now();
+    const rnd = U.rng(o.seed != null ? o.seed : Date.now());
+    let pool = o.ids ? o.ids.filter((id) => data.bank.has(id)) : [...data.bank.keys()];
+    if (o.subs && o.subs.length) pool = pool.filter((id) => o.subs.includes(data.bank.get(id).sub));
+    if (o.topics && o.topics.length) pool = pool.filter((id) => {
+      const q = data.bank.get(id);
+      return o.topics.includes(q.sub + '.' + q.topic);
+    });
+    if (o.types && o.types.length) pool = pool.filter((id) => o.types.includes(data.bank.get(id).type));
+    if (o.diffs && o.diffs.length) pool = pool.filter((id) => o.diffs.includes(data.bank.get(id).diff));
+    pool = pool.filter((id) => passFilter(id, o.filter, now));
+    const scored = pool.map((id) => ({ id, s: scoreFor(id, o.filter, rnd, now), topic: data.bank.get(id).sub + '.' + data.bank.get(id).topic }));
+    scored.sort((a, b) => b.s - a.s);
+    const chosen = [];
+    const taken = new Set();
+    const perTopic = {};
+    const inPool = new Set(pool);
+    while (chosen.length < o.n && taken.size < scored.length) {
+      let best = null;
+      let bestS = -Infinity;
+      for (const x of scored) {
+        if (taken.has(x.id)) continue;
+        const eff = x.s - 0.9 * (perTopic[x.topic] || 0);
+        if (eff > bestS) {
+          bestS = eff;
+          best = x;
+        }
+      }
+      if (!best) break;
+      const q = data.bank.get(best.id);
+      let group = [best.id];
+      if (o.keepCases && q.case) {
+        group = (data.byCase.get(q.case) || [best.id]).filter((id) => inPool.has(id) && !taken.has(id));
+        if (!group.includes(best.id)) group.unshift(best.id);
+      }
+      for (const id of group) taken.add(id);
+      perTopic[best.topic] = (perTopic[best.topic] || 0) + group.length;
+      chosen.push(group);
+    }
+    // casos juntos, el resto revuelto
+    return U.shuffle(chosen, rnd).flat();
+  };
+
+  // Selección tipo examen: por subárea, preferir no vistas y las vistas hace más tiempo; repartir temas.
+  S.pickExam = function (perSub, seed) {
+    const data = EG.data;
+    const rnd = U.rng(seed != null ? seed : Date.now());
+    const now = Date.now();
+    const out = [];
+    for (const sub of data.meta.subs) {
+      const need = perSub[sub.code] || 0;
+      if (!need) continue;
+      const ids = data.bySub.get(sub.code) || [];
+      const score = (id) => {
+        const st = S.derived.q.get(id);
+        return (st ? Math.min(6, (now - st.l) / (3 * DAY)) : 10) + rnd() * 2;
+      };
+      const groups = [];
+      const seenCase = new Set();
+      for (const id of ids) {
+        const q = data.bank.get(id);
+        if (q.case) {
+          if (seenCase.has(q.case)) continue;
+          seenCase.add(q.case);
+          const g = data.byCase.get(q.case) || [id];
+          groups.push({ ids: g, topic: q.topic, s: g.reduce((a, x) => a + score(x), 0) / g.length });
+        } else groups.push({ ids: [id], topic: q.topic, s: score(id) });
+      }
+      groups.sort((a, b) => b.s - a.s);
+      const per = {};
+      const pick = [];
+      let count = 0;
+      const used = new Set();
+      while (count < need && used.size < groups.length) {
+        let best = -1;
+        let bestS = -Infinity;
+        groups.forEach((g, k) => {
+          if (used.has(k)) return;
+          if (count + g.ids.length > need + (g.ids.length > 1 ? 1 : 0)) return;
+          const eff = g.s - 2.5 * (per[g.topic] || 0);
+          if (eff > bestS) {
+            bestS = eff;
+            best = k;
+          }
+        });
+        if (best < 0) break;
+        used.add(best);
+        const g = groups[best];
+        per[g.topic] = (per[g.topic] || 0) + 1;
+        pick.push(g.ids);
+        count += g.ids.length;
+      }
+      out.push(...U.shuffle(pick, rnd).flat());
+    }
+    return out;
+  };
+  S.EXAMS = {
+    completo: { name: 'Simulacro completo', desc: '200 reactivos como el examen real: 140 disciplinares y 60 de Lenguaje y Comunicación.', per: 10, lc: [30, 30], minutes: 480 },
+    disciplinar: { name: 'Sección disciplinar', desc: '140 reactivos: 10 por cada una de las 14 subáreas.', per: 10, lc: [0, 0], minutes: 336 },
+    medio: { name: 'Medio simulacro', desc: '100 reactivos: 5 por subárea y 30 de Lenguaje y Comunicación.', per: 5, lc: [15, 15], minutes: 240 },
+    rapido: { name: 'Simulacro rápido', desc: '48 reactivos: 3 por subárea y 6 de Lenguaje y Comunicación.', per: 3, lc: [3, 3], minutes: 115 },
+  };
+  S.examPerSub = function (kind, area) {
+    const cfg = S.EXAMS[kind];
+    const per = {};
+    for (const sub of EG.data.meta.subs) {
+      if (sub.area === 'LC') per[sub.code] = sub.code === 'LC1' ? cfg.lc[0] : cfg.lc[1];
+      else per[sub.code] = cfg.per;
+      if (area && sub.area !== area) per[sub.code] = 0;
+    }
+    return per;
+  };
+  S.diagPerSub = function () {
+    const per = {};
+    for (const sub of EG.data.meta.subs) per[sub.code] = sub.area === 'LC' ? (sub.code === 'LC1' ? 3 : 2) : 2;
+    return per;
+  };
+
+  // ---------- plan de estudio ----------
+  S.examDay = function () {
+    const p = S.profile();
+    if (p.examDate) return U.parseDay(p.examDate).getTime();
+    return null;
+  };
+  S.daysLeft = function () {
+    const e = S.examDay();
+    return e == null ? null : U.daysBetween(Date.now(), e);
+  };
+  S.plan = function () {
+    const today = U.startOfDay(Date.now());
+    const key = U.dayKey(today);
+    const p = S.profile();
+    const sig = [key, p.examDate, p.dailyGoal, (p.weak || []).join(','), EG.data.bank.size].join('|');
+    if (S.state.plan && S.state.plan.sig === sig) return S.state.plan;
+    const examT = S.examDay() || U.addDays(today, 30);
+    const L = Math.max(0, U.daysBetween(today, examT));
+    const goal = Math.max(10, p.dailyGoal || 40);
+    const days = [];
+    const diagDone = Object.values(S.state.ses).some((s) => s.k === 'diag' && s.done);
+    const simDays = new Set();
+    if (L >= 10) [Math.floor(L * 0.33), Math.floor(L * 0.62), L - 3].forEach((d) => simDays.add(d));
+    else if (L >= 5) simDays.add(L - 3);
+    const lightDay = L >= 3 ? L - 1 : -1;
+    const subs = EG.data.meta.subs;
+    const weight = (s) => {
+      const base = s.area === 'LC' ? (s.code === 'LC1' ? 0.45 : 0.55) : 1;
+      const weak = (p.weak || []).includes(s.code) || (p.weak || []).includes(s.area) ? 1.5 : 1;
+      const est = S.subStats(s.code).est;
+      return base * weak * (1.3 - est);
+    };
+    const studyIdx = [];
+    for (let d = 0; d < L; d++) if (!simDays.has(d) && d !== lightDay) studyIdx.push(d);
+    const slots = studyIdx.length * 2;
+    const ws = subs.map((s) => ({ code: s.code, area: s.area, w: weight(s) }));
+    const sumW = ws.reduce((a, x) => a + x.w, 0) || 1;
+    const minEach = slots >= subs.length ? 1 : 0;
+    let alloc = ws.map((x) => ({ ...x, n: minEach, r: 0 }));
+    let rest = slots - minEach * subs.length;
+    alloc.forEach((x) => {
+      const exact = (rest * x.w) / sumW;
+      x.n += Math.floor(exact);
+      x.r = exact - Math.floor(exact);
+    });
+    let left = slots - alloc.reduce((a, x) => a + x.n, 0);
+    alloc.slice().sort((a, b) => b.r - a.r).forEach((x) => {
+      if (left > 0) {
+        x.n++;
+        left--;
+      }
+    });
+    const remaining = new Map(alloc.map((x) => [x.code, x.n]));
+    const scheduled = new Set();
+    let prev = [];
+    const pickTwo = () => {
+      const cands = alloc.filter((x) => remaining.get(x.code) > 0);
+      const rank = (x) => remaining.get(x.code) + (scheduled.has(x.code) ? 0 : 3) + x.w - (prev.includes(x.code) ? 5 : 0);
+      cands.sort((a, b) => rank(b) - rank(a));
+      const a = cands[0];
+      if (!a) return [];
+      const b = cands.find((x) => x !== a && x.area !== a.area) || cands.find((x) => x !== a);
+      return b ? [a.code, b.code] : [a.code];
+    };
+    for (let d = 0; d < L; d++) {
+      const t = U.addDays(today, d);
+      const tasks = [];
+      if (d === 0 && !diagDone && L >= 3) tasks.push({ type: 'diag' });
+      if (simDays.has(d)) {
+        tasks.push({ type: 'exam', kind: d === L - 3 && L >= 10 ? 'completo' : 'medio' });
+        tasks.push({ type: 'review', n: Math.round(goal * 0.3) });
+      } else if (d === lightDay) {
+        tasks.push({ type: 'review', n: Math.round(goal * 0.5) });
+        tasks.push({ type: 'light' });
+      } else {
+        const two = pickTwo();
+        two.forEach((c) => {
+          remaining.set(c, remaining.get(c) - 1);
+          scheduled.add(c);
+        });
+        prev = two;
+        const share = tasks.some((x) => x.type === 'diag') ? 0.3 : 0.4;
+        two.forEach((c) => tasks.push({ type: 'study', sub: c, n: Math.max(8, Math.round(goal * share)) }));
+        tasks.push({ type: 'review', n: Math.max(6, Math.round(goal * 0.2)) });
+      }
+      days.push({ t, d, tasks });
+    }
+    S.state.plan = { sig, days, examT, L };
+    saveLocal();
+    return S.state.plan;
+  };
+  // Avance de hoy por tarea
+  S.todayProgress = function () {
+    const key = U.dayKey(Date.now());
+    const bySub = {};
+    let review = 0;
+    let exam = false;
+    let diag = false;
+    for (const s of Object.values(S.state.ses)) {
+      for (const qid of Object.keys(s.it)) {
+        const it = s.it[qid];
+        if (!it || it[0] == null || U.dayKey(it[3] || s.t0) !== key) continue;
+        const q = EG.data.bank.get(qid);
+        if (!q) continue;
+        if (s.k === 'review' || s.k === 'mistakes') review++;
+        else bySub[q.sub] = (bySub[q.sub] || 0) + 1;
+      }
+      if (s.done && U.dayKey(s.t1) === key) {
+        if (s.k === 'exam') exam = true;
+        if (s.k === 'diag') diag = true;
+      }
+    }
+    return { bySub, review, exam, diag };
+  };
+
+  // ---------- exportar / importar / reiniciar ----------
+  S.exportData = () => JSON.stringify({ app: 'egel-sobresaliente', v: 1, exported: new Date().toISOString(), main: S.state.main, marks: S.state.marks, ses: S.state.ses }, null, 0);
+  S.importData = function (text) {
+    const obj = JSON.parse(text);
+    if (!obj || obj.app !== 'egel-sobresaliente' || obj.v !== 1) throw new Error('El archivo no es un respaldo de esta app.');
+    mergeMain(obj.main, true);
+    mergeMarks(obj.marks);
+    const weeks = new Set();
+    for (const s of Object.values(obj.ses || {})) {
+      if (mergeSession(s)) weeks.add(U.weekKey(s.t0));
+    }
+    weeks.forEach((w) => touch('w-' + w));
+    touch('marks');
+    S.state.plan = null;
+    S.recompute();
+    emit('import');
+  };
+  S.reset = async function () {
+    const keys = docKeys();
+    S.state = defaults();
+    U.storage.set(KEY, S.state);
+    S.recompute();
+    if (SYNC.on) {
+      for (const k of keys) {
+        try {
+          await col().doc(k).delete();
+        } catch (e) {
+          /* se reintenta en la próxima sincronización */
+        }
+      }
+    }
+    emit('reset');
+  };
+
+  // ---------- sincronización con claude.ai (db por usuario) ----------
+  const SYNC = { on: false, db: null, uid: null, dirty: new Set(), writing: false, readonly: false, lastPull: 0 };
+  const col = () => SYNC.db.collection('data/users/' + SYNC.uid);
+  function docKeys() {
+    const keys = new Set(['main', 'marks']);
+    for (const s of Object.values(S.state.ses)) keys.add('w-' + U.weekKey(s.t0));
+    return [...keys];
+  }
+  function buildDoc(key) {
+    if (key === 'main') return { u: S.state.main.u, profile: S.state.main.profile, settings: S.state.main.settings, read: S.state.main.read };
+    if (key === 'marks') return { u: S.state.marks.u, q: S.state.marks.q };
+    const wk = key.slice(2);
+    const s = {};
+    let u = 0;
+    for (const x of Object.values(S.state.ses)) if (U.weekKey(x.t0) === wk) {
+      s[x.id] = x;
+      u = Math.max(u, x.u || 0);
+    }
+    return { u, s };
+  }
+  function mergeMain(remote, force) {
+    if (!remote) return false;
+    if (force || (remote.u || 0) > (S.state.main.u || 0)) {
+      const local = S.state.main;
+      S.state.main = {
+        u: Math.max(remote.u || 0, local.u || 0),
+        profile: Object.assign({}, local.profile, remote.profile || {}),
+        settings: Object.assign({}, local.settings, remote.settings || {}),
+        read: Object.assign({}, local.read, remote.read || {}),
+      };
+      S.state.plan = null;
+      return true;
+    }
+    return false;
+  }
+  function mergeMarks(remote) {
+    if (!remote || !remote.q) return false;
+    let changed = false;
+    for (const [id, m] of Object.entries(remote.q)) {
+      const l = S.state.marks.q[id];
+      if (!l || (m.t || 0) > (l.t || 0)) {
+        S.state.marks.q[id] = m;
+        changed = true;
+      }
+    }
+    S.state.marks.u = Math.max(S.state.marks.u || 0, remote.u || 0);
+    return changed;
+  }
+  function mergeSession(r) {
+    if (!r || !r.id || !Array.isArray(r.qs)) return false;
+    const l = S.state.ses[r.id];
+    if (!l || (r.u || 0) > (l.u || 0)) {
+      S.state.ses[r.id] = r;
+      return true;
+    }
+    return false;
+  }
+  async function pull() {
+    if (!SYNC.on) return;
+    SYNC.lastPull = Date.now();
+    S.sync.status = 'syncing';
+    emit('sync');
+    try {
+      const snap = await col().get();
+      const remoteKeys = new Set();
+      let changed = false;
+      for (const d of snap.docs) {
+        const body = d.data();
+        if (!body) continue;
+        remoteKeys.add(d.id);
+        if (d.id === 'main') {
+          if (mergeMain(body)) changed = true;
+          else if ((S.state.main.u || 0) > (body.u || 0)) SYNC.dirty.add('main');
+        } else if (d.id === 'marks') {
+          if (mergeMarks(body)) changed = true;
+          const localNewer = Object.entries(S.state.marks.q).some(([id, m]) => !body.q || !body.q[id] || (m.t || 0) > (body.q[id].t || 0));
+          if (localNewer) SYNC.dirty.add('marks');
+        } else if (d.id.startsWith('w-')) {
+          const rs = body.s || {};
+          for (const s of Object.values(rs)) if (mergeSession(s)) changed = true;
+          const wk = d.id.slice(2);
+          const localNewer = Object.values(S.state.ses).some((s) => U.weekKey(s.t0) === wk && (!rs[s.id] || (s.u || 0) > (rs[s.id].u || 0)));
+          if (localNewer) SYNC.dirty.add(d.id);
+        }
+      }
+      for (const k of docKeys()) if (!remoteKeys.has(k)) {
+        const b = buildDoc(k);
+        if (k === 'main' ? b.u || S.state.main.profile.onboarded : k === 'marks' ? Object.keys(b.q).length : Object.keys(b.s).length) SYNC.dirty.add(k);
+      }
+      S.sync.status = 'ok';
+      S.sync.last = Date.now();
+      S.sync.error = '';
+      if (changed) {
+        U.storage.set(KEY, S.state);
+        S.recompute();
+        emit('remote');
+      }
+      emit('sync');
+      if (SYNC.dirty.size) scheduleFlush();
+    } catch (e) {
+      S.sync.status = 'error';
+      S.sync.error = (e && e.code) || 'error';
+      emit('sync');
+    }
+  }
+  const scheduleFlush = U.debounce(() => flush(), 2500);
+  async function flush() {
+    if (!SYNC.on || SYNC.readonly || SYNC.writing || !SYNC.dirty.size) return;
+    SYNC.writing = true;
+    S.sync.status = 'syncing';
+    emit('sync');
+    try {
+      while (SYNC.dirty.size) {
+        const key = SYNC.dirty.values().next().value;
+        SYNC.dirty.delete(key);
+        const body = buildDoc(key);
+        try {
+          if (key.startsWith('w-') && !Object.keys(body.s).length) await col().doc(key).delete();
+          else await col().doc(key).set(JSON.parse(JSON.stringify(body)));
+        } catch (e) {
+          const code = e && e.code;
+          if (code === 'invalid_argument' || code === 'not_granted' || code === 'revoked') {
+            SYNC.readonly = true;
+            S.sync.mode = 'local';
+            S.sync.error = 'readonly';
+            break;
+          }
+          if (code === 'quota_exceeded') {
+            S.sync.error = 'quota';
+            break;
+          }
+          SYNC.dirty.add(key);
+          throw e;
+        }
+      }
+      S.sync.status = SYNC.readonly ? 'idle' : 'ok';
+      S.sync.last = Date.now();
+    } catch (e) {
+      S.sync.status = 'error';
+      S.sync.error = (e && e.code) || 'error';
+      setTimeout(() => scheduleFlush(), 15000);
+    } finally {
+      SYNC.writing = false;
+      emit('sync');
+    }
+  }
+  S.flushSync = () => {
+    saveLocal.flush();
+    if (SYNC.on) {
+      scheduleFlush.flush();
+    }
+  };
+  S.initSync = async function () {
+    const C = window.claude;
+    if (!C || typeof C.use !== 'function') return false;
+    let db = null;
+    let user = null;
+    try {
+      [db, user] = await Promise.all([C.use('db'), C.use('user')]);
+    } catch (e) {
+      return false;
+    }
+    if (!db || !user) return false;
+    let uid = null;
+    try {
+      uid = await user.id();
+    } catch (e) {
+      uid = null;
+    }
+    if (!uid) return false;
+    SYNC.db = db;
+    SYNC.uid = uid;
+    SYNC.on = true;
+    S.sync.mode = 'cloud';
+    await pull();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        if (Date.now() - SYNC.lastPull > 45000) pull();
+      } else {
+        S.flushSync();
+      }
+    });
+    window.addEventListener('pagehide', () => S.flushSync());
+    return true;
+  };
+  S.pullNow = () => pull();
+})();
