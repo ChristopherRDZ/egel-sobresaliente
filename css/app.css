@@ -754,6 +754,8 @@ figure.code code { font-family: inherit; background: none; border: 0; padding: 0
 .fe-w { stroke-width: 1; opacity: 0.55; }
 .fe-d { stroke: var(--ink-2); stroke-width: 1.8; }
 .fah { fill: var(--muted); }
+.fe-dash { stroke-dasharray: 7 5; }
+.fah-o { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linejoin: round; }
 .fl { fill: var(--ink); font-family: var(--f-body); font-size: 14px; font-weight: 700; }
 .fl-sm { font-size: 11px; }
 .fl-mono { font-family: var(--f-mono); }
@@ -882,6 +884,9 @@ figure.code code { font-family: inherit; background: none; border: 0; padding: 0
   .tog input:checked + .tog-s { forced-color-adjust: none; background: Highlight; }
   .tog-s::after { forced-color-adjust: none; background: CanvasText; }
   .mapc.fl::after, .bar > span { forced-color-adjust: none; background: Highlight; }
+  /* el dibujo de una figura (también la copia de «Ampliar figura») conserva el fondo del tema para el que se eligieron
+     sus colores: el sistema fuerza el fondo del marco, pero no los rellenos ni los trazos del svg */
+  .fig-svg { forced-color-adjust: none; background: var(--surface); }
 }
 
 @media (prefers-reduced-motion: reduce) {

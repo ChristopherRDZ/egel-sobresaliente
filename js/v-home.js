@@ -119,15 +119,20 @@
     if (n) WELCOME.name = n.value.trim();
     if (d && d.value) WELCOME.date = d.value;
   }
-  A['wel-next'] = () => {
+  function welGo(d) {
     welRead();
-    WELCOME.step = Math.min(2, WELCOME.step + 1);
+    WELCOME.step = U.clamp(WELCOME.step + d, 0, 2);
     EG.router.render({ scroll: 0 });
+  }
+  // cada paso tiene su entrada en el historial, agregada con el toque (activación del usuario) para que el Atrás del
+  // sistema regrese un paso; el «Atrás» de la página consume la del paso que deja
+  A['wel-next'] = () => {
+    if (EG.router.usesHistory && WELCOME.step < 2) EG.router.hist(() => history.pushState({ n: EG.router.depth() + 1 }, ''));
+    welGo(1);
   };
   A['wel-prev'] = () => {
-    welRead();
-    WELCOME.step = Math.max(0, WELCOME.step - 1);
-    EG.router.render({ scroll: 0 });
+    if (EG.router.usesHistory && WELCOME.step > 0 && EG.router.depth() > 0) EG.router.histGo(-1);
+    welGo(-1);
   };
   A['wel-goal'] = (el) => {
     welRead();
@@ -142,10 +147,11 @@
     el.classList.toggle('on');
     el.setAttribute('aria-pressed', String(WELCOME.weak.has(c)));
   };
-  // botón Atrás del sistema en la bienvenida: un paso atrás; false si ya está en el primero
+  // botón Atrás del sistema en la bienvenida (el navegador ya retrocedió la entrada del paso): un paso atrás; false si
+  // ya está en el primero
   EG.welcomeBack = () => {
     if (!WELCOME.step) return false;
-    A['wel-prev']();
+    welGo(-1);
     return true;
   };
   A['wel-finish'] = (el) => {

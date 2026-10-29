@@ -108,8 +108,62 @@
       window.addEventListener('pagehide', () => S.flushSync());
     }
   };
-  const saveLocal = U.debounce(() => U.storage.set(KEY, S.state), 300);
+  // al ocultar o cerrar solo se escribe si esta pestaña tiene algo sin guardar: otra pestaña o ventana del mismo sitio
+  // pudo guardar después, y escribir el estado completo de esta, sin cambios, lo borraría
+  let localPending = false;
+  const saveLocalNow = U.debounce(() => {
+    localPending = false;
+    U.storage.set(KEY, S.state);
+  }, 300);
+  const saveLocal = () => {
+    localPending = true;
+    saveLocalNow();
+  };
+  saveLocal.flush = () => {
+    if (localPending) saveLocalNow.flush();
+  };
   S.saveNow = () => saveLocal.flush();
+  // Otra pestaña o ventana del mismo sitio guardó (por ejemplo, la PWA instalada y una pestaña del navegador): fusionar
+  // lo suyo como en un pull, para que lo que guarde esta después lo conserve en vez de pisarlo
+  window.addEventListener('storage', (e) => {
+    if (e.key !== KEY || !e.newValue || !S.state) return;
+    let o = null;
+    try {
+      o = JSON.parse(e.newValue);
+    } catch (err) {
+      return;
+    }
+    if (!isObj(o) || o.v !== 1 || !isObj(o.main) || (o.owner && S.state.owner && o.owner !== S.state.owner)) return;
+    let changed = false;
+    const rAt = Number(o.main.resetAt) || 0;
+    if (rAt > (S.state.main.resetAt || 0)) {
+      dropBefore(rAt);
+      changed = true;
+    }
+    if (mergeMain(o.main)) changed = true;
+    if (mergeMarks(o.marks)) changed = true;
+    const after = S.state.main.resetAt || 0;
+    for (const s of Object.values(isObj(o.ses) ? o.ses : {})) {
+      if (isObj(s) && Math.max(s.t0 || 0, s.u || 0) >= after && mergeSession(s, true)) changed = true;
+    }
+    // la copia que llegó no tiene algo que esta pestaña sí (la escribió otra con una versión anterior, que guarda su estado
+    // completo al ocultarse, o se cruzaron dos guardados): volver a guardar, porque al cerrar esta ya no escribe nada
+    const rses = isObj(o.ses) ? o.ses : {};
+    const rq = isObj(o.marks) && isObj(o.marks.q) ? o.marks.q : {};
+    const rrd = isObj(o.main.read) ? o.main.read : {};
+    if (
+      (S.state.main.u || 0) > (Number(o.main.u) || 0) ||
+      (S.state.main.resetAt || 0) > rAt ||
+      Object.values(S.state.ses).some((l) => ahead(l, rses[l.id])) ||
+      Object.entries(S.state.marks.q).some(([id, m]) => !isObj(rq[id]) || (m.t || 0) > (rq[id].t || 0)) ||
+      Object.entries(S.state.main.read).some(([k, t]) => Math.abs(t) > Math.abs(Number(rrd[k]) || 0))
+    )
+      saveLocal();
+    if (!changed) return;
+    S.state.plan = null;
+    S.recompute();
+    emit('remote');
+  });
 
   // Marca un documento como modificado: guarda local y agenda la sincronización.
   function touch(docKey) {
@@ -260,7 +314,8 @@
     const g = extra && extra.g ? 1 : 0;
     s.it[qid] = [ans, S.grade(EG.data.bank.get(qid), ans), Math.round((prev && prev[2]) || 0) + Math.round(ms || 0), Date.now(), g];
     touchSession(s);
-    if (s.mode === 'tutor') S.recompute();
+    // también en simulacro: sus respuestas, aún sin calificar, cuentan ya en la actividad del día y la racha
+    S.recompute();
     emit('answer');
   };
   S.setGuess = function (s, qid, on) {
@@ -872,7 +927,8 @@
   }
   // Fusiona una sesión remota dentro del objeto local, que la vista abierta sigue usando: por pregunta gana
   // la respuesta más reciente; terminada y tiempo se acumulan; marcas y posición son de la copia más nueva.
-  function mergeSession(r) {
+  // quietEl: el cronómetro que avanzó en otra pestaña (su tic guarda cada 15 s) se adopta sin contar como cambio
+  function mergeSession(r, quietEl) {
     if (!cleanSession(r)) return false;
     const l = S.state.ses[r.id];
     if (!l) {
@@ -908,7 +964,7 @@
     }
     if ((r.el || 0) > (l.el || 0)) {
       l.el = r.el;
-      changed = true;
+      if (!quietEl) changed = true;
     }
     if (newer) {
       if (l.pos !== r.pos || JSON.stringify(l.fl) !== JSON.stringify(r.fl)) changed = true;

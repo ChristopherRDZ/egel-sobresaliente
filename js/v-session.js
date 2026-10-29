@@ -134,6 +134,19 @@
   // ---------- corredor ----------
   // drafts: selección incompleta por pregunta (modo examen); elSaved: cronómetro ya guardado; ptr: ver onPtr
   const RUN = { s: null, i: 0, st: null, qStart: 0, tick: null, saveT: 0, key: null, drafts: {}, elSaved: 0, ptr: false };
+  // al ocultar o cerrar la app con el cronómetro del simulacro en marcha, guardar el tiempo que todavía no se guardó
+  // (el tic solo guarda cada 15 s, y el guardado al ocultar solo escribe lo pendiente)
+  const saveClock = () => {
+    if (RUN.s && RUN.s.el !== RUN.elSaved) {
+      S.touchSession(RUN.s);
+      RUN.elSaved = RUN.s.el;
+      S.flushSync();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') saveClock();
+  });
+  window.addEventListener('pagehide', saveClock);
   // una sincronización pudo traer respuestas a la sesión abierta (se fusionan en el mismo objeto): mostrarlas
   S.on((why) => {
     if (why !== 'remote' || !RUN.s) return;
@@ -258,9 +271,12 @@
     const cbTop = cb && !(opts && opts.top) ? cb.scrollTop : 0;
     el.innerHTML = runHtml();
     afterRender();
+    // mostrar u ocultar «Ampliar figura» cambia la altura: decidirlo antes de restaurar el desplazamiento y el foco
+    U.$$('.fig[data-w]', el).forEach(EG.fig.fit);
     const cb2 = cbTop ? U.$('.case-b', el) : null;
     if (cb2) cb2.scrollTop = cbTop;
-    ui.restoreFocus(el, key, ['#runNext', '#runCheck:not(:disabled)', '.ord-pool button']);
+    // al cambiar de pregunta, sin respaldos: el foco no pasa a un control de la pregunta nueva (Enter lo pulsaría)
+    ui.restoreFocus(el, key, opts && opts.top ? [] : ['#runNext', '#runCheck:not(:disabled)', '.ord-pool button']);
     if (opts && opts.top) window.scrollTo(0, 0);
     else window.scrollTo(0, y);
     if (opts && opts.focusFb) {
@@ -286,7 +302,8 @@
         if (btn) btn.disabled = !selectionComplete(CTX.q, RUN.st);
       });
       inp.addEventListener('change', () => {
-        if (RUN.s.mode === 'exam') commitExam();
+        // también llega al quitar el campo con la vista ya desmontada (sin sesión)
+        if (RUN.s && RUN.s.mode === 'exam') commitExam();
       });
       inp.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -336,6 +353,9 @@
     }
     RUN.i = ni;
     S.setPos(s, ni);
+    // el foco en una opción no pasa a la opción homóloga de la pregunta siguiente (Enter la elegiría)
+    const a = document.activeElement;
+    if (a && a.matches && a.matches('[data-act="q-pick"], [data-act="q-unpick"]')) U.$('#view').focus({ preventScroll: true });
     rerender({ top: true });
   }
   async function finishFlow(force) {
@@ -416,9 +436,9 @@
     RUN.ptr = true;
   }
   function onKey(e) {
-    // cualquier tecla vuelve al modo teclado
+    // cualquier tecla vuelve al modo teclado, salvo una modificadora sola (Ctrl + rueda para ampliar, Alt+Tab)
     const ptr = RUN.ptr;
-    RUN.ptr = false;
+    if (!['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock'].includes(e.key)) RUN.ptr = false;
     if (EG.ui.layers.length || !RUN.s) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -552,6 +572,8 @@
   A['run-exit'] = async () => {
     const s = RUN.s;
     if (!s) return EG.router.back();
+    // confirmar la numérica escrita, como las demás salidas: el Atrás del sistema no le quita el foco antes de contar
+    if (s.mode === 'exam') commitExamIfInput();
     const nAns = s.qs.filter((id) => isAnswered(s, id)).length;
     if (!nAns) {
       S.discard(s);

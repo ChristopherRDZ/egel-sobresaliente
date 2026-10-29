@@ -184,6 +184,8 @@
   // Enfoca el mismo control; si ya no existe o está deshabilitado, el primero de fallbacks que sirva, o la vista.
   function restoreFocus(root, key, fallbacks) {
     if (!root || !key) return;
+    // «Ampliar figura» nace oculto hasta que fit mide la figura: medir ya, para poder devolverle el foco
+    if (EG.fig && EG.fig.fit) root.querySelectorAll('.fig[data-w]').forEach(EG.fig.fit);
     const usable = (x) => !!x && !x.disabled && typeof x.focus === 'function';
     let el = root.querySelectorAll(key.sel)[key.k] || root.querySelector(key.sel);
     if (!usable(el)) el = (fallbacks || []).map((s) => root.querySelector(s)).find(usable) || root;
@@ -248,7 +250,8 @@
       else if (o.root) {
         hist(() => {
           const n = depth();
-          if (name === 'home') R.histGo(-n);
+          // Inicio y el primer paso de la bienvenida ocupan la entrada base
+          if (name === 'home' || name === 'welcome') R.histGo(-n);
           else if (!n) history.pushState({ n: 1 }, '');
           else {
             R.histGo(1 - n);

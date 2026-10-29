@@ -106,19 +106,23 @@
         R.back(to, true);
         return;
       }
+      // Atrás cierra el diálogo o pregunta si salir de la sesión: regresar a la entrada que se acaba de dejar (un
+      // recorrido) y no volver a agregarla, porque un pushState sin activación del usuario hace que Chrome omita
+      // después todas las entradas de la app y el siguiente Atrás saldría de ella
       if (ui.layers.length) {
         ui.closeTop();
-        history.pushState({ n: R.depth() + 1 }, '');
+        R.histGo(R.at - R.depth());
         return;
       }
       if (R.cur && R.cur.name === 'session') {
-        history.pushState({ n: R.depth() + 1 }, '');
+        // antes que run-exit: su R.back (sesión sin respuestas) espera en la cola hasta el popstate de ese regreso
+        R.histGo(R.at - R.depth());
         EG.actions['run-exit']();
         return;
       }
-      // en la bienvenida, Atrás regresa un paso sin saltarla; en el primero queda en la entrada base
+      // en la bienvenida cada paso tiene su entrada (el primero, la base): el navegador ya retrocedió un paso
       if (R.cur && R.cur.name === 'welcome') {
-        if (EG.welcomeBack && EG.welcomeBack()) history.pushState({ n: R.depth() + 1 }, '');
+        if (EG.welcomeBack) EG.welcomeBack();
         return;
       }
       if (R.stack.length) R.back(null, true);
@@ -133,7 +137,8 @@
         return;
       }
       onPop();
-      // también las entradas que agregan el diálogo, la sesión y la bienvenida
+      // la entrada a la que llegó Atrás (R.back y la navegación raíz desde el popstate); si onPop regresó con
+      // R.histGo, R.ownPop la corrige cuando llega ese popstate
       R.at = R.depth();
     });
   }
@@ -207,8 +212,8 @@
     const sync = EG.store.initSync();
     if (window.claude && !EG.store.profile().onboarded) await Promise.race([sync.catch(() => {}), new Promise((r) => setTimeout(r, 8000))]);
     const onboarded = EG.store.profile().onboarded;
-    // la bienvenida va encima de la entrada base, para que Atrás regrese un paso (EG.welcomeBack) sin salir de la app
-    R.go(onboarded ? 'home' : 'welcome', {}, { root: true, replace: onboarded });
+    // el primer paso de la bienvenida ocupa la entrada base; Empezar y Continuar agregan la de cada paso (wel-next)
+    R.go(onboarded ? 'home' : 'welcome', {}, { root: true, replace: true });
     updateSide();
     const bootEl = U.$('#boot');
     if (bootEl) {

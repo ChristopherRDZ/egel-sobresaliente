@@ -13,9 +13,11 @@
   const wrap = (w, h, body, label, maxW, x0, y0) => {
     const id = `fg${++seq}`;
     const W = Math.ceil(w);
-    const defs = `<defs><marker id="${id}a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fah"/></marker></defs>`;
+    // MARK: punta rellena; OPENM: punta abierta (dependencias de UML, con línea discontinua), solo si se usa
+    const open = body.includes('OPENM') ? `<marker id="${id}o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1,1 L9,5 L1,9" class="fah-o"/></marker>` : '';
+    const defs = `<defs><marker id="${id}a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fah"/></marker>${open}</defs>`;
     const zi = EG.ui && EG.ui.icon ? EG.ui.icon('expand') : '';
-    return `<figure class="fig" data-w="${W}"><svg class="fig-svg" data-act="fig-zoom" viewBox="${x0 || 0} ${y0 || 0} ${W} ${Math.ceil(h)}" style="max-width:${maxW || W}px;min-width:min(100%, ${Math.round(W * 0.62)}px)" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`)}</svg><button type="button" class="btn btn-ghost btn-sm fig-zoom" data-act="fig-zoom" hidden>${zi}<span>Ampliar figura</span></button></figure>`;
+    return `<figure class="fig" data-w="${W}"><svg class="fig-svg" data-act="fig-zoom" viewBox="${x0 || 0} ${y0 || 0} ${W} ${Math.ceil(h)}" style="max-width:${maxW || W}px;min-width:min(100%, ${Math.round(W * 0.62)}px)" role="img" aria-label="${esc(label)}">${defs}${body.replace(/MARK/g, `url(#${id}a)`).replace(/OPENM/g, `url(#${id}o)`)}</svg><button type="button" class="btn btn-ghost btn-sm fig-zoom" data-act="fig-zoom" hidden>${zi}<span>Ampliar figura</span></button></figure>`;
   };
   const list = (xs) => xs.join(', ');
   const unit = (dx, dy) => {
@@ -92,10 +94,32 @@
     const maxD = Math.max(...all.map((n) => n.depth));
     const PAD = 30;
     const MX = Math.max(PAD + 10, half + 8);
-    for (const n of all) {
-      n.px = MX + (n.x - minX) * DX;
-      n.py = PAD + n.depth * DY;
+    for (const n of all) n.px = MX + (n.x - minX) * DX;
+    // separación vertical por nivel: con un abanico ancho (p. ej. un árbol de derivación) la arista a un hijo lejano
+    // pasaría encima de un hermano más cercano; ese nivel crece hasta que la arista lo libra por 6 px
+    const gaps = Array.from({ length: maxD }, () => DY);
+    const near = (p, a, b, dy) => {
+      for (let k = 0; k <= 40; k++) {
+        const x = p.px + ((a.px - p.px) * k) / 40;
+        const y = (dy * k) / 40;
+        const d = b.r ? Math.hypot(x - b.px, y - dy) - b.r : Math.max(Math.abs(x - b.px) - b.w / 2, Math.abs(y - dy) - b.h / 2);
+        if (d < 6) return true;
+      }
+      return false;
+    };
+    for (const p of all) {
+      for (const a of p.kids) {
+        for (const b of p.kids) {
+          const da = a.px - p.px;
+          const db = b.px - p.px;
+          if (a === b || da * db <= 0 || Math.abs(db) >= Math.abs(da)) continue;
+          while (gaps[p.depth] < 160 && near(p, a, b, gaps[p.depth])) gaps[p.depth] += 2;
+        }
+      }
     }
+    const ys = [PAD];
+    for (let d = 1; d <= maxD; d++) ys.push(ys[d - 1] + gaps[d - 1]);
+    for (const n of all) n.py = ys[n.depth];
     let body = '';
     for (const n of all) {
       for (const k of n.kids) {
@@ -107,7 +131,7 @@
     }
     for (const n of all) body += drawNode({ x: n.px, y: n.py, r: n.r, w: n.w, h: n.h }, n.v, { hl: n.hl });
     const w = MX * 2 + (maxX - minX) * DX;
-    const h = PAD * 2 + maxD * DY;
+    const h = PAD + ys[maxD];
     // descripción: hijos de cada nodo (en los binarios, izquierdo y derecho, con "vacío" si falta)
     const rows = [];
     (function desc(n) {
@@ -151,7 +175,8 @@
     });
     const byId = new Map(nodes.map((p) => [p.id, p]));
     const directed = !!f.directed;
-    const edges = (f.edges || []).map((e) => ({ from: String(e.from), to: String(e.to), label: e.label != null ? String(e.label) : e.w != null ? String(e.w) : '' }));
+    // dash: línea discontinua con punta abierta (dependencia de UML)
+    const edges = (f.edges || []).map((e) => ({ from: String(e.from), to: String(e.to), label: e.label != null ? String(e.label) : e.w != null ? String(e.w) : '', dash: e.dash === true }));
     const pairs = new Set(edges.map((e) => `${e.from}→${e.to}`));
     let body = '';
     let labels = '';
@@ -169,6 +194,8 @@
       const a = byId.get(e.from);
       const b = byId.get(e.to);
       if (!a || !b) continue;
+      const cls = e.dash ? 'fe fe-dash' : 'fe';
+      const mk = e.dash ? 'OPENM' : 'MARK';
       if (a === b) {
         const cx = W / 2;
         const cy = H / 2;
@@ -181,7 +208,7 @@
         const c2 = [base[0] + ox * 46 - px * 22, base[1] + oy * 46 - py * 22];
         const s = [a.x + (ox + px * 0.5) * r * 0.9, a.y + (oy + py * 0.5) * r * 0.9];
         const en = [a.x + (ox - px * 0.5) * r * 0.9, a.y + (oy - py * 0.5) * r * 0.9];
-        body += `<path d="M${s[0]},${s[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${en[0]},${en[1]}" class="fe"${directed ? ' marker-end="MARK"' : ''}/>`;
+        body += `<path d="M${s[0]},${s[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${en[0]},${en[1]}" class="${cls}"${directed ? ` marker-end="${mk}"` : ''}/>`;
         ext(c1[0], c1[1], 2, 2);
         ext(c2[0], c2[1], 2, 2);
         if (e.label) {
@@ -201,7 +228,7 @@
         const [ex, ey] = unit(c[0] - b.x, c[1] - b.y);
         const p1 = border(a, sx, sy);
         const p2 = border(b, ex, ey);
-        body += `<path d="M${p1[0]},${p1[1]} Q${c[0]},${c[1]} ${p2[0]},${p2[1]}" class="fe" marker-end="MARK"/>`;
+        body += `<path d="M${p1[0]},${p1[1]} Q${c[0]},${c[1]} ${p2[0]},${p2[1]}" class="${cls}" marker-end="${mk}"/>`;
         const mid = [0.25 * p1[0] + 0.5 * c[0] + 0.25 * p2[0], 0.25 * p1[1] + 0.5 * c[1] + 0.25 * p2[1]];
         ext(mid[0], mid[1], 2, 2);
         if (e.label) {
@@ -211,7 +238,7 @@
       } else {
         const p1 = border(a, ux, uy);
         const p2 = border(b, -ux, -uy);
-        body += `<line x1="${p1[0]}" y1="${p1[1]}" x2="${p2[0]}" y2="${p2[1]}" class="fe"${directed ? ' marker-end="MARK"' : ''}/>`;
+        body += `<line x1="${p1[0]}" y1="${p1[1]}" x2="${p2[0]}" y2="${p2[1]}" class="${cls}"${directed ? ` marker-end="${mk}"` : ''}/>`;
         if (e.label) {
           labels += t((p1[0] + p2[0]) / 2 - uy * 11, (p1[1] + p2[1]) / 2 + ux * 11, e.label, 'fel');
           extLabel((p1[0] + p2[0]) / 2 - uy * 11, (p1[1] + p2[1]) / 2 + ux * 11, e.label);
@@ -263,14 +290,17 @@
     const pos = [];
     let maxUp = 0;
     let maxDown = 0;
+    // altura del arco por distancia entre estados: un arco que salta dos o más estados sale más empinado que el de
+    // uno solo, para que dos arcos del mismo estado (S2→S1 y S2→S0) no salgan juntos ni se crucen bajo la etiqueta
+    const arcH = (span) => 18 + span * 22 + (span - 1) * 40;
     if (row) {
       for (const e of merged.values()) {
         const i = idx.get(e.a);
         const j = idx.get(e.b);
         const span = Math.abs(j - i);
         if (i === j) maxUp = Math.max(maxUp, 52);
-        else if (j > i && (span > 1 || merged.has(`${e.b}→${e.a}`))) maxUp = Math.max(maxUp, 18 + span * 22);
-        else if (j < i) maxDown = Math.max(maxDown, 18 + span * 22);
+        else if (j > i && (span > 1 || merged.has(`${e.b}→${e.a}`))) maxUp = Math.max(maxUp, arcH(span));
+        else if (j < i) maxDown = Math.max(maxDown, arcH(span));
       }
       W = 90 + (n - 1) * DX + 60;
       const top = 26 + maxUp;
@@ -320,7 +350,7 @@
           continue;
         }
         const up = j > i;
-        const hgt = 18 + span * 22;
+        const hgt = arcH(span);
         c = [(a.x + b.x) / 2, a.y + (up ? -1 : 1) * hgt * 2];
       } else {
         const mx = (a.x + b.x) / 2;
@@ -464,7 +494,8 @@
   const KINDS = { tree, graph, automaton, tape, dendrogram, layers };
 
   // Figura que el contenedor reduce a menos del 85 % (teléfono): se ofrece verla a tamaño natural. Se mide al
-  // aparecer y al cambiar de ancho (girar el teléfono, abrir el caso que la contiene).
+  // aparecer y al cambiar de ancho (girar el teléfono, abrir el caso que la contiene); al volver a dibujar la vista,
+  // también antes de restaurar el foco y el desplazamiento (EG.fig.fit en rerender y en ui.restoreFocus).
   function fit(f) {
     const svg = f && f.querySelector('.fig-svg');
     const b = f && f.querySelector('.fig-zoom');
@@ -509,9 +540,10 @@
     c.removeAttribute('data-act');
     c.setAttribute('style', `width:${Number(f.dataset.w)}px;max-width:none`);
     let html = c.outerHTML;
-    const m = c.querySelector('marker');
-    if (m) {
-      const nid = `fg${++seq}a`;
+    // marcadores fg<n>a (punta rellena) y fg<n>o (abierta): el mismo número nuevo para los dos
+    const np = `fg${++seq}`;
+    for (const m of c.querySelectorAll('marker')) {
+      const nid = np + m.id.slice(-1);
       html = html.split(`id="${m.id}"`).join(`id="${nid}"`).split(`url(#${m.id})`).join(`url(#${nid})`);
     }
     EG.ui.modal({
@@ -538,5 +570,6 @@
       }
     },
     zoom,
+    fit,
   };
 })();
